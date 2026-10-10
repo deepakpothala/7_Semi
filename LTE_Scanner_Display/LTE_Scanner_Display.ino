@@ -26,7 +26,7 @@
 #define COMPANY_ID 0xFFFF
 #define MAGIC0 '7'
 #define MAGIC1 'S'
-#define PROTOCOL_VERSION 2
+#define PROTOCOL_VERSION 3  // v3: status carries data byte counters and NTP time
 
 #define NET_FLAG_4G 0x10
 #define NET_FLAG_3G 0x20
@@ -169,6 +169,8 @@ struct StatusRx {
   uint8_t dataState;         // DATA_*
   uint16_t dataAge;          // seconds since the last good internet check
   uint16_t dataLatencyMs;    // NTP round trip of that check
+  uint32_t bytesSent, bytesReceived;  // modem mobile data counter
+  uint32_t ntpEpoch;         // UTC time from the last good NTP check, 0 = none
   unsigned long seen;
 };
 
@@ -195,7 +197,7 @@ uint32_t get32(const uint8_t *p) {
 // formed, replaces everything the display knows in one step. Cells that the
 // beacon no longer reports therefore disappear with the next snapshot.
 bool decodeSnapshot(const uint8_t *d, size_t n, int rssi) {
-  if (n < 25 || get16(d) != COMPANY_ID || d[2] != MAGIC0 || d[3] != MAGIC1) return false;
+  if (n < 37 || get16(d) != COMPANY_ID || d[2] != MAGIC0 || d[3] != MAGIC1) return false;
   if (d[4] != PROTOCOL_VERSION) return false;
   unsigned long now = millis();
   size_t i = 6;
@@ -213,6 +215,9 @@ bool decodeSnapshot(const uint8_t *d, size_t n, int rssi) {
   s.dataState = d[i++];
   s.dataAge = get16(d + i); i += 2;
   s.dataLatencyMs = get16(d + i); i += 2;
+  s.bytesSent = get32(d + i); i += 4;
+  s.bytesReceived = get32(d + i); i += 4;
+  s.ntpEpoch = get32(d + i); i += 4;
   s.seen = now;
 
   CellRx c[MAX_CELLS] = {};
@@ -400,6 +405,34 @@ void drawHeader(unsigned long now, unsigned long last, int rssi, const StatusRx 
   }
 }
 
+// One line describing the beacon's last internet check (every 2 minutes):
+// "Internet OK 21:19:54 UTC (368 ms)" when it worked, otherwise why not.
+void internetLine(const StatusRx &st, unsigned long now, char *out, size_t outSize, uint16_t &color) {
+  char clock[16] = "";
+  if (st.ntpEpoch) {
+    uint32_t t = st.ntpEpoch % 86400;
+    snprintf(clock, sizeof(clock), "%02lu:%02lu:%02lu", (unsigned long)(t / 3600),
+             (unsigned long)(t / 60 % 60), (unsigned long)(t % 60));
+  }
+  long age = st.dataAge == 0xFFFF ? -1 : st.dataAge + (long)(now - st.seen) / 1000;
+
+  if (!st.valid || st.dataState == DATA_UNKNOWN) {
+    snprintf(out, outSize, "Internet: not checked yet");
+    color = C_DIM;
+  } else if (st.dataState == DATA_OK && age >= 0 && age <= DATA_STALE_S) {
+    if (clock[0]) snprintf(out, outSize, "Internet OK %s UTC (%u ms)", clock, st.dataLatencyMs);
+    else snprintf(out, outSize, "Internet OK (%u ms)", st.dataLatencyMs);
+    color = C_GREEN;
+  } else if (st.dataState == DATA_NO_CONTEXT) {
+    snprintf(out, outSize, "Internet: no data connection");
+    color = C_AMBER;
+  } else {
+    if (clock[0]) snprintf(out, outSize, "Internet: check failed (last OK %s)", clock);
+    else snprintf(out, outSize, "Internet: check failed");
+    color = C_AMBER;
+  }
+}
+
 void drawCardMessage(int x, int y, int w, int h, const char *title, const char *detail, uint16_t color) {
   canvas.setFont(&fonts::DejaVu12);
   canvas.setTextColor(color);
@@ -497,32 +530,65 @@ void drawServingCard(const CellRx *serving, const Network *nets, int numNets,
   canvas.drawString(detail, x + 10, y + 74);
 }
 
-void drawNeighbourCard(const CellRx *list, int count) {
+// Compact byte count: 950, 2.3k, 14.8M (decimal units, like phone data meters).
+void formatBytes(uint32_t b, char *out, size_t outSize) {
+  if (b < 1000) snprintf(out, outSize, "%lu", (unsigned long)b);
+  else if (b < 1000000) snprintf(out, outSize, "%.1fk", b / 1e3);
+  else if (b < 1000000000) snprintf(out, outSize, "%.1fM", b / 1e6);
+  else snprintf(out, outSize, "%.1fG", b / 1e9);
+}
+
+// Bottom-left card: neighbour cells, with mobile data usage in the title row.
+void drawNeighbourCard(const CellRx *list, int count, const StatusRx &st) {
   const int x = 6, y = 124, w = 198, h = 40;
   canvas.fillSmoothRoundRect(x, y, w, h, 8, C_CARD);
   canvas.setFont(&fonts::DejaVu9);
   canvas.setTextColor(C_DIM);
   canvas.setTextDatum(textdatum_t::top_left);
-  canvas.drawString("NEIGHBOUR CELLS", x + 10, y + 5);
+  canvas.drawString("NEIGHBOURS", x + 10, y + 5);
+
+  // Mobile data used, from the modem's byte counter.
+  if (st.valid) {
+    char sent[12], received[12], usage[32];
+    formatBytes(st.bytesSent, sent, sizeof(sent));
+    formatBytes(st.bytesReceived, received, sizeof(received));
+    snprintf(usage, sizeof(usage), "TX %s  RX %s", sent, received);
+    canvas.setTextColor(C_ACCENT);
+    canvas.setTextDatum(textdatum_t::top_right);
+    canvas.drawString(usage, x + w - 8, y + 5);
+    canvas.setTextDatum(textdatum_t::top_left);
+  }
 
   if (count == 0) {
     canvas.setTextColor(C_FAINT);
-    canvas.drawString("none reported", x + 10, y + 22);
+    canvas.drawString("no neighbour cells", x + 10, y + 22);
     return;
   }
 
+  // Chips, strongest first. If they don't all fit, the last slot becomes a
+  // "+N" chip so hidden neighbours are never silently dropped.
+  const int right = x + w - 6, gap = 4;
   int cx = x + 8;
+  canvas.setTextDatum(textdatum_t::middle_left);
   for (int i = 0; i < count; i++) {
     char label[16];
     snprintf(label, sizeof(label), "B%u %d", list[i].band, list[i].rsrp);
-    int cw = canvas.textWidth(label) + 22;
-    if (cx + cw > x + w - 6) break;
+    int cw = canvas.textWidth(label) + 18;
+    char more[8];
+    snprintf(more, sizeof(more), "+%d", count - i - 1);
+    int moreW = i < count - 1 ? canvas.textWidth(more) + 12 + gap : 0;
+    if (cx + cw + moreW > right) {
+      snprintf(more, sizeof(more), "+%d", count - i);
+      canvas.fillSmoothRoundRect(cx, y + 19, canvas.textWidth(more) + 12, 16, 8, C_CHIP);
+      canvas.setTextColor(C_DIM);
+      canvas.drawString(more, cx + 6, y + 28);
+      break;
+    }
     canvas.fillSmoothRoundRect(cx, y + 19, cw, 16, 8, C_CHIP);
-    canvas.fillSmoothCircle(cx + 8, y + 27, 3, rsrpQuality(list[i].rsrp).color);
+    canvas.fillSmoothCircle(cx + 7, y + 27, 3, rsrpQuality(list[i].rsrp).color);
     canvas.setTextColor(C_TEXT);
-    canvas.setTextDatum(textdatum_t::middle_left);
-    canvas.drawString(label, cx + 15, y + 28);
-    cx += cw + 5;
+    canvas.drawString(label, cx + 13, y + 28);
+    cx += cw + gap;
   }
 }
 
@@ -570,23 +636,30 @@ void drawNetworksCard(const Network *nets, int count, bool scanning) {
       barRsrp = n.rsrp4g;
       canvas.setFont(&fonts::DejaVu12);
     } else {
-      snprintf(value, sizeof(value), n.rssi2g ? "2G %d" : "--", n.rssi2g);
+      snprintf(value, sizeof(value), n.rssi2g ? "%d" : "--", n.rssi2g);
       valueColor = C_DIM;
-      canvas.setFont(&fonts::DejaVu9);
+      canvas.setFont(&fonts::DejaVu12);
     }
     canvas.setTextColor(valueColor);
     int vw = canvas.drawString(value, x + w - 7, ry);
 
-    canvas.fillSmoothCircle(x + 11, ry + 6, 3, current ? C_GREEN : C_FAINT);
+    // Left: the best technology this operator offers here. The value on the
+    // right is its signal (4G RSRP, or 2G RSSI for a 2G-only operator).
+    const char *tech = (n.flags & NET_FLAG_4G) ? "4G" : (n.flags & NET_FLAG_3G) ? "3G"
+                       : (n.flags & NET_FLAG_2G) ? "2G" : "--";
+    canvas.setFont(&fonts::DejaVu9);
+    canvas.setTextColor((n.flags & NET_FLAG_4G) ? C_ACCENT : C_AMBER);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.drawString(tech, x + 6, ry + 2);
+
     canvas.setFont(&fonts::DejaVu12);
     char fitted[12];
-    fitText(n.name, fitted, sizeof(fitted), w - 30 - vw);
+    fitText(n.name, fitted, sizeof(fitted), w - 32 - vw);
     canvas.setTextColor(current ? C_GREEN : C_TEXT);
-    canvas.setTextDatum(textdatum_t::top_left);
-    canvas.drawString(fitted, x + 19, ry);
+    canvas.drawString(fitted, x + 21, ry);
 
     // Thin signal bar under the name: RSRP -140 (empty) .. -44 dBm (full).
-    const int bx = x + 19, bw = w - 26;
+    const int bx = x + 21, bw = w - 28;
     canvas.fillRect(bx, ry + 15, bw, 3, C_FAINT);
     int fill = constrain((barRsrp + 140) * bw / 96, 0, bw);
     if (fill > 0) canvas.fillRect(bx, ry + 15, fill, 3, valueColor);
@@ -652,7 +725,7 @@ void drawScreen() {
   canvas.fillScreen(C_BG);
   drawHeader(now, last, rssi, st);
   drawServingCard(serving, nets, numNets, st, cellAge);
-  drawNeighbourCard(neigh, numNeigh);
+  drawNeighbourCard(neigh, numNeigh, st);
   drawNetworksCard(nets, numNets, st.valid && (st.flags & STATUS_FLAG_NET_SCAN));
   canvas.pushSprite(0, 0);
 }
@@ -700,7 +773,22 @@ void loop() {
   }
   if (millis() - lastLog >= 10000) {
     lastLog = millis();
-    Serial.printf("snapshots: %lu, last %u bytes, beacon RSSI %d dBm\n",
-                  (unsigned long)snapshotsReceived, (unsigned)lastSnapshotLen, beaconRssi);
+    StatusRx st;
+    CellRx c[MAX_CELLS];
+    portENTER_CRITICAL(&dataMux);
+    st = beaconStatus;
+    memcpy(c, cells, sizeof(c));
+    portEXIT_CRITICAL(&dataMux);
+    String neigh = "";
+    for (auto &x : c) {
+      if (x.used && x.kind != KIND_SERVING) neigh += " B" + String(x.band) + " " + String(x.rsrp);
+    }
+    Serial.printf("neighbours:%s\n", neigh.length() ? neigh.c_str() : " none");
+    char line[48];
+    uint16_t color;
+    internetLine(st, millis(), line, sizeof(line), color);
+    Serial.printf("snapshots: %lu, last %u bytes, beacon RSSI %d dBm | %s | TX %lu B RX %lu B\n",
+                  (unsigned long)snapshotsReceived, (unsigned)lastSnapshotLen, beaconRssi, line,
+                  (unsigned long)st.bytesSent, (unsigned long)st.bytesReceived);
   }
 }

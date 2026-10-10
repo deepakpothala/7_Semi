@@ -50,10 +50,12 @@
 #define COMPANY_ID 0xFFFF  // Bluetooth SIG ID reserved for testing
 #define MAGIC0 '7'
 #define MAGIC1 'S'
-#define PROTOCOL_VERSION 2  // v1 was one 31-byte legacy advert per record
+// v1 was one 31-byte legacy advert per record; v2 the snapshot; v3 adds the
+// mobile data byte counters and the last NTP time to the status block.
+#define PROTOCOL_VERSION 3
 #define SNAP_MAX_CELLS 8
 #define SNAP_MAX_NETS 6
-#define SNAP_MAX_BYTES 232  // 24 header+status, 1+9+8*9 cells, 1+6*19 networks
+#define SNAP_MAX_BYTES 240  // 36 header+status, 1+9+8*9 cells, 1+6*19 networks = 233
 
 #define MODEM_STARTING 0
 #define MODEM_NO_SIM 1
@@ -119,6 +121,9 @@ static volatile uint8_t modemHardResets = 0;  // GPIO9 resets
 static volatile uint8_t dataState = DATA_UNKNOWN;
 static volatile unsigned long lastDataOk = 0;  // millis(), 0 = never
 static volatile uint16_t dataLatencyMs = 0;    // NTP round trip of the last good check
+static volatile uint32_t dataBytesSent = 0;      // modem's mobile data counter (AT+QGDCNT)
+static volatile uint32_t dataBytesReceived = 0;
+static volatile uint32_t ntpEpoch = 0;  // UTC time from the last good NTP check, 0 = none
 
 // Modem health, only touched by the modem task.
 static int atTimeouts = 0;
@@ -417,6 +422,18 @@ String waitForUrc(const char *prefix, unsigned long timeoutMs) {
   return "";
 }
 
+// Seconds since 1970-01-01 UTC for a civil date and time (days-from-civil
+// algorithm, valid for any Gregorian date).
+uint32_t utcEpoch(int y, int mon, int d, int h, int minute, int s) {
+  y -= mon <= 2;
+  int era = y / 400;
+  int yoe = y - era * 400;
+  int doy = (153 * (mon + (mon > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  long days = era * 146097L + doe - 719468;
+  return (uint32_t)(days * 86400L + h * 3600L + minute * 60L + s);
+}
+
 // Proves the modem can reach the internet: activates the data context if it
 // has no IP (e.g. after a modem reset), then asks an NTP server for the time.
 bool checkData() {
@@ -438,7 +455,7 @@ bool checkData() {
   String urc = "";
   int p = r.indexOf("+QNTP:");
   if (p >= 0) urc = r.substring(p);
-  else if (r.indexOf("OK") >= 0) urc = waitForUrc("+QNTP:", 30000);
+  else if (r.indexOf("OK") >= 0) urc = waitForUrc("+QNTP:", 125000);  // AT manual max response time
   unsigned long latency = millis() - t0;
 
   if (urc.length() == 0 || urc.substring(6).toInt() != 0) {
@@ -449,7 +466,14 @@ bool checkData() {
   dataState = DATA_OK;
   lastDataOk = millis();
   dataLatencyMs = (uint16_t)min(latency, 65535UL);
-  Serial.printf("Internet OK: %s (%lu ms)\n", urc.c_str(), latency);
+  // +QNTP: 0,"2026/10/10,21:19:54+22": the time is UTC (the modem's clock,
+  // AT+CCLK, matched the PC's UTC); the +22 suffix is a quarter-hour zone.
+  int Y, M, D, h, m, s;
+  if (sscanf(urc.c_str(), "+QNTP: %*d,\"%d/%d/%d,%d:%d:%d", &Y, &M, &D, &h, &m, &s) == 6) {
+    ntpEpoch = utcEpoch(Y, M, D, h, m, s);
+  }
+  Serial.printf("Internet OK: %s (%lu ms), data sent %lu B, received %lu B\n", urc.c_str(), latency,
+                (unsigned long)dataBytesSent, (unsigned long)dataBytesReceived);
   return true;
 }
 
@@ -525,6 +549,18 @@ bool updateStatus() {
   }
   bool registered = stat == 1 || stat == 5;
   modemState = registered ? MODEM_REGISTERED : MODEM_SEARCHING;
+
+  // Mobile data byte counter: +QGDCNT: <bytes sent>,<bytes received>
+  r = sendAT("AT+QGDCNT?");
+  p = r.indexOf("+QGDCNT:");
+  if (p >= 0) {
+    String counts = r.substring(p + 8);
+    int comma = counts.indexOf(',');
+    if (comma > 0) {
+      dataBytesSent = strtoul(counts.c_str(), nullptr, 10);
+      dataBytesReceived = strtoul(counts.c_str() + comma + 1, nullptr, 10);
+    }
+  }
   return registered;
 }
 
@@ -587,6 +623,10 @@ void put16(uint8_t *p, uint16_t v) {
   p[1] = v >> 8;
 }
 
+void put32(uint8_t *p, uint32_t v) {
+  for (int b = 0; b < 4; b++) p[b] = (v >> (8 * b)) & 0xFF;
+}
+
 uint16_t ageSeconds(unsigned long t, unsigned long now) {
   if (t == 0) return 0xFFFF;  // never
   return (uint16_t)min((now - t) / 1000, 0xFFFEUL);
@@ -618,6 +658,9 @@ int buildSnapshot(uint8_t *p) {
   p[i++] = dataState;
   put16(p + i, ageSeconds(lastDataOk, now)); i += 2;
   put16(p + i, dataLatencyMs); i += 2;
+  put32(p + i, dataBytesSent); i += 4;
+  put32(p + i, dataBytesReceived); i += 4;
+  put32(p + i, ntpEpoch); i += 4;
 
   xSemaphoreTake(dataLock, portMAX_DELAY);
 
