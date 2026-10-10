@@ -49,8 +49,9 @@ its own port is connected too.
   (`AT+COPS=?`) every 10 min, then broadcasts each record as a BLE
   advertisement, rotating every 500 ms.
 - `LTE_Scanner_Display/` - Runs on a LilyGO T-Display-S3. Listens for the
-  beacon's adverts and shows operators plus cells sorted by RSRP with signal
-  bars. Needs the "GFX Library for Arduino" library. Board settings: ESP32S3
+  beacon's adverts and draws a dashboard: serving cell (RSRP in dBm, signal
+  bars, quality rating), neighbour cells, and visible networks. Needs the
+  LovyanGFX library. Board settings: ESP32S3
   Dev Module, USB CDC On Boot Enabled, PSRAM OPI, Flash 16MB.
 
 Both LTE scanner sketches target Arduino-ESP32 core 3.x.
