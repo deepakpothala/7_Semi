@@ -1,27 +1,32 @@
 // LilyGO T-Display-S3: receiver for LTE_Scanner_Beacon.
-// Passively scans BLE for the 7Semi beacon's adverts, collects the operator
-// and LTE cell records, and draws a dashboard on the 320x170 display:
-// serving cell with signal bars, neighbour cells, and visible networks.
-// The beacon's status advert tells it the modem state and how old the cell
-// data is, so stale or missing data is shown as such rather than as live.
+// Passively scans for the 7Semi beacon's BLE 5 extended adverts. Each one is
+// a complete snapshot (modem status, cells, networks) that replaces what is
+// shown, and the dashboard on the 320x170 display shows the serving cell
+// with signal bars, neighbour cells, and visible networks. The status part
+// gives the modem state and how old the cell data is, so stale or missing
+// data is shown as such rather than as live.
 //
-// Built for Arduino-ESP32 core 3.x. Needs the LovyanGFX library.
+// Built for Arduino-ESP32 core 3.x. Needs the LovyanGFX library and the
+// NimBLE-Arduino library (2.x) with CONFIG_BT_NIMBLE_EXT_ADV enabled in its
+// nimconfig.h, so it can receive extended adverts.
 // Board: ESP32S3 Dev Module, USB CDC On Boot: Enabled, PSRAM: OPI PSRAM.
 // Advert format: see README.md "BLE advert format".
 
 #include <LovyanGFX.hpp>
-#include <BLEDevice.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
+#include <NimBLEDevice.h>
 #include <esp_task_wdt.h>
+#include <algorithm>
+
+#if !CONFIG_BT_NIMBLE_EXT_ADV
+#error "Enable CONFIG_BT_NIMBLE_EXT_ADV in NimBLE-Arduino's src/nimconfig.h"
+#endif
 
 #define PIN_LCD_POWER 15
 
+#define COMPANY_ID 0xFFFF
 #define MAGIC0 '7'
 #define MAGIC1 'S'
-#define TYPE_CELL 1
-#define TYPE_STATUS 3
-#define TYPE_NETWORK 4
+#define PROTOCOL_VERSION 2
 
 #define NET_FLAG_4G 0x10
 #define NET_FLAG_3G 0x20
@@ -46,7 +51,7 @@
 
 #define MAX_CELLS 16
 #define MAX_NETWORKS 8
-#define EXPIRE_MS 30000  // drop records the beacon stopped sending
+#define EXPIRE_MS 30000  // clear everything if no snapshot arrives for this long
 #define STALE_MS 5000    // beacon counts as lost after this long without adverts
 #define CELL_STALE_S 15  // serving cell readout dims when older than this
 #define REDRAW_MS 500
@@ -172,6 +177,8 @@ static NetRx netTable[MAX_NETWORKS];
 static StatusRx beaconStatus;
 static int beaconRssi = 0;
 static unsigned long lastPacket = 0;
+static uint32_t snapshotsReceived = 0;  // for the serial log
+static size_t lastSnapshotLen = 0;
 static portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ---------- BLE ----------
@@ -180,106 +187,111 @@ uint16_t get16(const uint8_t *p) {
   return p[0] | (p[1] << 8);
 }
 
-// Slot for this cell: the existing entry, else a free one, else the oldest.
-int cellSlot(uint16_t earfcn, uint16_t pci) {
-  int oldest = 0;
-  for (int i = 0; i < MAX_CELLS; i++) {
-    if (cells[i].used && cells[i].earfcn == earfcn && cells[i].pci == pci) return i;
-  }
-  for (int i = 0; i < MAX_CELLS; i++) {
-    if (!cells[i].used) return i;
-    if (cells[i].seen < cells[oldest].seen) oldest = i;
-  }
-  return oldest;
+uint32_t get32(const uint8_t *p) {
+  return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-int netSlot(uint16_t mcc, uint16_t mnc) {
-  int oldest = 0;
-  for (int i = 0; i < MAX_NETWORKS; i++) {
-    if (netTable[i].used && netTable[i].mcc == mcc && netTable[i].mnc == mnc) return i;
-  }
-  for (int i = 0; i < MAX_NETWORKS; i++) {
-    if (!netTable[i].used) return i;
-    if (netTable[i].seen < netTable[oldest].seen) oldest = i;
-  }
-  return oldest;
-}
+// Decodes one protocol v2 snapshot (see README.md) and, if it is well
+// formed, replaces everything the display knows in one step. Cells that the
+// beacon no longer reports therefore disappear with the next snapshot.
+bool decodeSnapshot(const uint8_t *d, size_t n, int rssi) {
+  if (n < 25 || get16(d) != COMPANY_ID || d[2] != MAGIC0 || d[3] != MAGIC1) return false;
+  if (d[4] != PROTOCOL_VERSION) return false;
+  unsigned long now = millis();
+  size_t i = 6;
 
-class BeaconCallbacks : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice dev) override {
-    if (!dev.haveManufacturerData()) return;
-    String md = dev.getManufacturerData();
-    const uint8_t *d = (const uint8_t *)md.c_str();
-    size_t n = md.length();
-    if (n < 8 || d[0] != 0xFF || d[1] != 0xFF || d[2] != MAGIC0 || d[3] != MAGIC1) return;
+  StatusRx s;
+  s.valid = true;
+  s.state = d[i++];
+  s.flags = d[i++];
+  s.csq = d[i++];
+  s.cellAge = get16(d + i); i += 2;
+  s.netAge = get16(d + i); i += 2;
+  s.uptime = get32(d + i); i += 4;
+  s.recoveries = d[i++];
+  s.hardResets = d[i++];
+  s.dataState = d[i++];
+  s.dataAge = get16(d + i); i += 2;
+  s.dataLatencyMs = get16(d + i); i += 2;
+  s.seen = now;
 
-    unsigned long now = millis();
-    uint8_t type = d[4];
-
-    if (type == TYPE_CELL && n >= 25) {
-      CellRx c;
-      c.used = true;
-      c.mcc = get16(d + 8);
-      c.mnc = get16(d + 10);
-      c.kind = d[12] & 0x03;
-      c.mnc3 = d[12] & 0x04;
-      c.tdd = d[12] & 0x08;
-      c.band = d[13];
-      c.earfcn = get16(d + 14);
-      c.pci = get16(d + 16);
-      c.rsrp = (int8_t)d[18];
-      c.rsrq = (int8_t)d[19];
-      c.sinr = (int8_t)d[20];
-      c.cellId = d[21] | (d[22] << 8) | (d[23] << 16) | ((uint32_t)d[24] << 24);
-      c.seen = now;
-      portENTER_CRITICAL(&dataMux);
-      cells[cellSlot(c.earfcn, c.pci)] = c;
-      beaconRssi = dev.getRSSI();
-      lastPacket = now;
-      portEXIT_CRITICAL(&dataMux);
-    } else if (type == TYPE_NETWORK && n >= 17) {
-      NetRx w;
-      w.used = true;
-      w.mcc = get16(d + 8);
-      w.mnc = get16(d + 10);
-      w.flags = d[12];
-      w.rsrp4g = (int8_t)d[13];
-      w.band4g = d[14];
-      w.cells4g = d[15];
-      w.rssi2g = (int8_t)d[16];
-      size_t len = min(n - 17, sizeof(w.name) - 1);
-      memcpy(w.name, d + 17, len);
-      w.name[len] = '\0';
-      w.seen = now;
-      portENTER_CRITICAL(&dataMux);
-      netTable[netSlot(w.mcc, w.mnc)] = w;
-      beaconRssi = dev.getRSSI();
-      lastPacket = now;
-      portEXIT_CRITICAL(&dataMux);
-    } else if (type == TYPE_STATUS && n >= 21) {
-      StatusRx s;
-      s.valid = true;
-      s.state = d[8];
-      s.flags = d[9];
-      s.csq = d[10];
-      s.cellAge = get16(d + 11);
-      s.netAge = get16(d + 13);
-      s.uptime = d[15] | (d[16] << 8) | (d[17] << 16) | ((uint32_t)d[18] << 24);
-      s.recoveries = d[19];
-      s.hardResets = d[20];
-      // Internet check fields, absent from older beacon firmware.
-      s.dataState = n >= 26 ? d[21] : DATA_UNKNOWN;
-      s.dataAge = n >= 26 ? get16(d + 22) : 0xFFFF;
-      s.dataLatencyMs = n >= 26 ? get16(d + 24) : 0;
-      s.seen = now;
-      portENTER_CRITICAL(&dataMux);
-      beaconStatus = s;
-      beaconRssi = dev.getRSSI();
-      lastPacket = now;
-      portEXIT_CRITICAL(&dataMux);
+  CellRx c[MAX_CELLS] = {};
+  int nc = d[i++];
+  if (nc > MAX_CELLS) return false;
+  if (nc > 0) {
+    if (i + 9 + nc * 9 > n) return false;
+    uint16_t mcc = get16(d + i), mnc = get16(d + i + 2);
+    bool mnc3 = d[i + 4] & 0x04;
+    uint32_t servingId = get32(d + i + 5);
+    i += 9;
+    for (int k = 0; k < nc; k++) {
+      c[k].used = true;
+      c[k].mcc = mcc;
+      c[k].mnc = mnc;
+      c[k].mnc3 = mnc3;
+      c[k].kind = d[i] & 0x03;
+      c[k].tdd = d[i] & 0x08;
+      c[k].band = d[i + 1];
+      c[k].earfcn = get16(d + i + 2);
+      c[k].pci = get16(d + i + 4);
+      c[k].rsrp = (int8_t)d[i + 6];
+      c[k].rsrq = (int8_t)d[i + 7];
+      c[k].sinr = (int8_t)d[i + 8];
+      c[k].cellId = c[k].kind == KIND_SERVING ? servingId : 0;
+      c[k].seen = now;
+      i += 9;
     }
   }
+
+  NetRx w[MAX_NETWORKS] = {};
+  if (i >= n) return false;
+  int nn = d[i++];
+  if (nn > MAX_NETWORKS) return false;
+  for (int k = 0; k < nn; k++) {
+    if (i + 10 > n) return false;
+    w[k].used = true;
+    w[k].mcc = get16(d + i);
+    w[k].mnc = get16(d + i + 2);
+    w[k].flags = d[i + 4];
+    w[k].rsrp4g = (int8_t)d[i + 5];
+    w[k].band4g = d[i + 6];
+    w[k].cells4g = d[i + 7];
+    w[k].rssi2g = (int8_t)d[i + 8];
+    size_t len = d[i + 9];
+    i += 10;
+    if (i + len > n) return false;
+    size_t copy = min(len, sizeof(w[k].name) - 1);
+    memcpy(w[k].name, d + i, copy);
+    w[k].name[copy] = '\0';
+    w[k].seen = now;
+    i += len;
+  }
+
+  portENTER_CRITICAL(&dataMux);
+  memcpy(cells, c, sizeof(cells));
+  memcpy(netTable, w, sizeof(netTable));
+  beaconStatus = s;
+  beaconRssi = rssi;
+  lastPacket = now;
+  snapshotsReceived++;
+  lastSnapshotLen = n;
+  portEXIT_CRITICAL(&dataMux);
+  return true;
+}
+
+class BeaconCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice *dev) override {
+    if (!dev->haveManufacturerData()) return;
+    std::string md = dev->getManufacturerData();
+    decodeSnapshot((const uint8_t *)md.data(), md.size(), dev->getRSSI());
+  }
+
+  // The scan only stops if something goes wrong; start it again.
+  void onScanEnd(const NimBLEScanResults &results, int reason) override {
+    NimBLEDevice::getScan()->start(0, false, true);
+  }
 };
+
 
 // ---------- Drawing ----------
 
@@ -657,14 +669,16 @@ void setup() {
   if (!canvas.createSprite(tft.width(), tft.height())) Serial.println("Sprite alloc failed");
   drawScreen();
 
-  BLEDevice::init("");
-  BLEScan *scan = BLEDevice::getScan();
-  // wantDuplicates = true: the beacon reuses one address for every record.
-  scan->setAdvertisedDeviceCallbacks(new BeaconCallbacks(), true);
+  NimBLEDevice::init("");
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  // wantDuplicates = true: every snapshot comes from the same address.
+  scan->setScanCallbacks(new BeaconCallbacks(), true);
+  scan->setDuplicateFilter(false);
+  scan->setMaxResults(0);  // decode in the callback; keep nothing in memory
   scan->setActiveScan(false);
   scan->setInterval(100);
   scan->setWindow(100);  // window == interval: listen continuously
-  scan->start(0, nullptr, false);  // 0 = scan forever, in the background
+  scan->start(0, false, true);  // 0 = scan forever, in the background
   Serial.println("Scanning for 7Semi LTE beacon...");
 
   // Restart if the draw loop ever stops running.
@@ -678,10 +692,15 @@ void setup() {
 }
 
 void loop() {
-  static unsigned long lastDraw = 0;
+  static unsigned long lastDraw = 0, lastLog = 0;
   if (millis() - lastDraw >= REDRAW_MS) {
     lastDraw = millis();
     drawScreen();
     esp_task_wdt_reset();
+  }
+  if (millis() - lastLog >= 10000) {
+    lastLog = millis();
+    Serial.printf("snapshots: %lu, last %u bytes, beacon RSSI %d dBm\n",
+                  (unsigned long)snapshotsReceived, (unsigned)lastSnapshotLen, beaconRssi);
   }
 }

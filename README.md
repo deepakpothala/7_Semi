@@ -61,83 +61,99 @@ its own port is connected too.
   count. Requires the GNSS antenna and open sky.
 - `LTE_Scanner_Beacon/` - Runs on this board. Reads the serving and
   neighbour LTE cells (`AT+QENG`) every 5 s and every operator in range with
-  its strongest cells (`AT+QOPS`, ~40 s) every 3 min, then broadcasts each
-  record plus a status record as BLE advertisements, rotating every 500 ms.
-  Recovers the modem by itself: re-initialises it after a reboot or
-  repeated timeouts, and hard-resets it through GPIO 9 if it stops
-  answering entirely.
-- `LTE_Scanner_Display/` - Runs on a LilyGO T-Display-S3. Listens for the
-  beacon's adverts and draws a dashboard: serving cell (RSRP in dBm, signal
-  bars, quality rating), neighbour cells, and visible networks. Needs the
-  LovyanGFX library. Board settings: ESP32S3
-  Dev Module, USB CDC On Boot Enabled, PSRAM OPI, Flash 16MB.
+  its strongest cells (`AT+QOPS`, ~40 s) every 3 min, checks the internet
+  connection every 2 min, and once a second broadcasts everything as one
+  BLE 5 extended advertisement at +20 dBm. Recovers the modem by itself:
+  re-initialises it after a reboot or repeated timeouts, and hard-resets it
+  through GPIO 9 if it stops answering entirely.
+- `LTE_Scanner_Display/` - Runs on a LilyGO T-Display-S3. Receives the
+  beacon's snapshots and draws a dashboard: serving cell (RSRP in dBm, signal
+  bars, quality rating), neighbour cells, visible networks with their best
+  signal, and modem / internet status. Needs the LovyanGFX library. Board
+  settings: ESP32S3 Dev Module, USB CDC On Boot Enabled, PSRAM OPI, Flash 16MB.
 
-Both LTE scanner sketches target Arduino-ESP32 core 3.x.
+Both LTE scanner sketches target Arduino-ESP32 core 3.x and need the
+**NimBLE-Arduino** library (2.x) with extended advertising enabled: in its
+`src/nimconfig.h`, uncomment `#define CONFIG_BT_NIMBLE_EXT_ADV 1`. (The
+core's built-in BLE library is compiled without extended advertising.) Both
+boards are ESP32-S3, which supports BLE 5; the original ESP32 does not.
 
 ## BLE advert format
 
-Manufacturer-specific data (AD type 0xFF), all multi-byte fields little-endian:
+Protocol version 2. The beacon sends one non-connectable BLE 5 extended
+advertisement (1M PHY, every 100 ms, +20 dBm) whose manufacturer-specific
+data (AD type 0xFF) is a complete snapshot, rebuilt every second. The
+receiver replaces everything it shows with each snapshot, so a cell the
+modem stops reporting disappears with the next one. A snapshot is at most
+221 bytes, so it fits one advertising PDU without chaining. All multi-byte
+fields are little-endian.
 
-| Bytes | Field                                                        |
-|-------|--------------------------------------------------------------|
-| 0-1   | Company ID `0xFFFF` (Bluetooth SIG test ID)                  |
-| 2-3   | Magic `'7' 'S'`                                              |
-| 4     | Type: 1 = LTE cell, 3 = beacon status, 4 = network (type 2, the old `AT+COPS=?` operator record, is retired) |
-| 5     | Scan sequence number (increments each scan of that type)     |
-| 6-7   | Record index, record count                                   |
+(Version 1 sent one 31-byte legacy advert per record in rotation; the
+status record alone had filled the 26 usable bytes.)
 
-Cells and networks continue with:
+Header and status, 24 bytes:
 
-| Bytes | Field                                                        |
-|-------|--------------------------------------------------------------|
-| 8-9   | MCC                                                          |
-| 10-11 | MNC                                                          |
-| 12    | Flags. Cells: bits 0-1 kind (0 serving, 1 intra-freq neighbour, 2 inter-freq neighbour), bit 3 TDD. Networks: bit 4 has 4G, bit 5 has 3G, bit 6 has 2G. Both: bit 2 three-digit MNC |
+| Bytes | Field                                                                 |
+|-------|-----------------------------------------------------------------------|
+| 0-1   | Company ID `0xFFFF` (Bluetooth SIG test ID)                           |
+| 2-3   | Magic `'7' 'S'`                                                       |
+| 4     | Protocol version (2)                                                  |
+| 5     | Snapshot sequence number                                              |
+| 6     | Modem state: 0 starting, 1 SIM not ready, 2 searching, 3 registered, 4 not responding |
+| 7     | Flags: bit 0 network scan (`AT+QOPS`) in progress                     |
+| 8     | CSQ signal (0-31, 99 = unknown)                                       |
+| 9-10  | Seconds since the last good serving-cell reading (0xFFFF = never)     |
+| 11-12 | Seconds since the last good network scan (0xFFFF = never)             |
+| 13-16 | Beacon uptime, seconds                                                |
+| 17    | Number of times the beacon has re-initialised the modem (soft)       |
+| 18    | Number of times the beacon has hard-reset the modem (GPIO 9)         |
+| 19    | Internet check: 0 not checked, 1 OK, 2 no IP (APN/activation failed), 3 NTP failed |
+| 20-21 | Seconds since the last good internet check (0xFFFF = never)          |
+| 22-23 | NTP round trip of the last good check, ms                            |
 
-Cell (type 1), 25 bytes total:
+Cells: a count byte (0-8), then, if non-zero, a 9-byte block for the serving
+operator followed by 9 bytes per cell (serving cell first, then neighbours
+strongest first). Neighbours are configured by the serving operator, so all
+cells share its MCC/MNC.
 
-| Bytes | Field                      |
-|-------|----------------------------|
-| 13    | LTE band                   |
-| 14-15 | EARFCN                     |
-| 16-17 | Physical cell ID (PCI)     |
-| 18    | RSRP, int8 dBm             |
-| 19    | RSRQ, int8 dB              |
-| 20    | SINR, int8 dB (serving cell only; -128 = unknown) |
-| 21-24 | Cell ID (serving cell only, else 0) |
+| Bytes | Field                                                       |
+|-------|-------------------------------------------------------------|
+| 0-1   | MCC                                                         |
+| 2-3   | MNC                                                         |
+| 4     | Flags: bit 2 three-digit MNC                                |
+| 5-8   | Serving cell ID (0 if no serving cell)                      |
+
+Per cell:
+
+| Bytes | Field                                                       |
+|-------|-------------------------------------------------------------|
+| 0     | Bits 0-1 kind (0 serving, 1 intra-freq neighbour, 2 inter-freq neighbour), bit 3 TDD |
+| 1     | LTE band                                                    |
+| 2-3   | EARFCN                                                      |
+| 4-5   | Physical cell ID (PCI)                                      |
+| 6     | RSRP, int8 dBm                                              |
+| 7     | RSRQ, int8 dB                                               |
+| 8     | SINR, int8 dB (serving cell only; -128 = unknown)           |
 
 SINR comes from the modem as X with dB = X / 2 - 23.5 (EC200U AT manual).
 Neighbour lines carry a similar-looking field that stays fixed per cell, so
 neighbours report SINR as unknown.
 
-Network (type 4), one per operator from `AT+QOPS`, up to 26 bytes:
+Networks: a count byte (0-6), then per operator from `AT+QOPS`:
 
 | Bytes | Field                                                       |
 |-------|-------------------------------------------------------------|
-| 13    | Strongest 4G cell RSRP, int8 dBm (0 = no 4G cell)           |
-| 14    | LTE band of that cell                                       |
-| 15    | Number of distinct 4G cells seen                            |
-| 16    | Strongest 2G cell RSSI, int8 dBm (0 = no 2G cell)           |
-| 17-   | Operator short name (else MCC-MNC), up to 9 ASCII chars     |
+| 0-1   | MCC                                                         |
+| 2-3   | MNC                                                         |
+| 4     | Flags: bit 2 three-digit MNC, bit 4 has 4G, bit 5 has 3G, bit 6 has 2G |
+| 5     | Strongest 4G cell RSRP, int8 dBm (0 = no 4G cell)           |
+| 6     | LTE band of that cell                                       |
+| 7     | Number of distinct 4G cells seen                            |
+| 8     | Strongest 2G cell RSSI, int8 dBm (0 = no 2G cell)           |
+| 9     | Name length n (0-9)                                         |
+| 10-   | Operator short name (else MCC-MNC), n ASCII chars           |
 
 The registered network is the one whose MCC/MNC matches the serving cell.
-
-Beacon status (type 3), 26 bytes total, sent once per rotation (even when
-there is no cell or network data, so the receiver knows the beacon is alive):
-
-| Bytes | Field                                                                 |
-|-------|-----------------------------------------------------------------------|
-| 8     | Modem state: 0 starting, 1 SIM not ready, 2 searching, 3 registered, 4 not responding |
-| 9     | Flags: bit 0 network scan (`AT+QOPS`) in progress                     |
-| 10    | CSQ signal (0-31, 99 = unknown)                                       |
-| 11-12 | Seconds since the last good serving-cell reading (0xFFFF = never)     |
-| 13-14 | Seconds since the last good network scan (0xFFFF = never)             |
-| 15-18 | Beacon uptime, seconds                                                |
-| 19    | Number of times the beacon has re-initialised the modem (soft)       |
-| 20    | Number of times the beacon has hard-reset the modem (GPIO 9)         |
-| 21    | Internet check: 0 not checked, 1 OK, 2 no IP (APN/activation failed), 3 NTP failed |
-| 22-23 | Seconds since the last good internet check (0xFFFF = never)          |
-| 24-25 | NTP round trip of the last good check, ms                            |
 
 ## Reference docs
 

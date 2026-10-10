@@ -1,22 +1,28 @@
 // 7Semi ESP32-S3 EC200U: LTE network scanner -> BLE beacon.
 // The EC200U reports the serving LTE cell and its neighbour cells
 // (AT+QENG) plus every operator in range with its cells' signal (AT+QOPS).
-// The ESP32-S3 packs each result into a BLE advertisement and rotates
-// through them, together with a status advert describing the modem's state.
-// LTE_Scanner_Display (LilyGO T-Display-S3) listens for these adverts.
+// Once a second the ESP32-S3 packs everything (modem status, cells,
+// networks) into one snapshot and broadcasts it as a BLE 5 extended
+// advertisement at +20 dBm. LTE_Scanner_Display (LilyGO T-Display-S3)
+// listens for it.
 //
 // Reliability: waits for the modem (AT, SIM, registration) before scanning,
 // re-initialises it if it reboots ("RDY") or stops answering, hard-resets it
 // through GPIO9 if it won't answer at all, and a task watchdog restarts the
 // ESP32 if the modem task or advert loop hangs.
 //
-// Built for Arduino-ESP32 core 3.x (its built-in BLE library).
+// Built for Arduino-ESP32 core 3.x with the NimBLE-Arduino library (2.x),
+// which must have CONFIG_BT_NIMBLE_EXT_ADV enabled in its nimconfig.h.
 // Advert format: see README.md "BLE advert format".
 
-#include <BLEDevice.h>
-#include <BLEAdvertising.h>
+#include <NimBLEDevice.h>
 #include <esp_task_wdt.h>
+#include <algorithm>
 #include <functional>
+
+#if !CONFIG_BT_NIMBLE_EXT_ADV
+#error "Enable CONFIG_BT_NIMBLE_EXT_ADV in NimBLE-Arduino's src/nimconfig.h"
+#endif
 
 #define MODEM_RX_PIN 12  // ESP32 RX <- EC200U TX (manual says 16; measured 12)
 #define MODEM_TX_PIN 13  // ESP32 TX -> EC200U RX (manual says 17; measured 13)
@@ -34,17 +40,20 @@
 #define CELL_SCAN_INTERVAL_MS 5000
 #define NETWORK_SCAN_INTERVAL_MS (3UL * 60 * 1000)  // AT+QOPS takes ~40 s
 #define NETWORK_RETRY_MS (60UL * 1000)
-#define ADV_DWELL_MS 500  // how long each record is advertised
 #define WDT_TIMEOUT_MS 30000
 #define MAX_AT_TIMEOUTS 3  // consecutive timeouts before re-initialising the modem
+
+#define TX_POWER_DBM 20            // ESP32-S3 maximum
+#define SNAPSHOT_INTERVAL_MS 1000  // how often the advertised snapshot is rebuilt
+#define ADV_INTERVAL_UNITS 160     // advertise every 100 ms (units of 0.625 ms)
 
 #define COMPANY_ID 0xFFFF  // Bluetooth SIG ID reserved for testing
 #define MAGIC0 '7'
 #define MAGIC1 'S'
-#define TYPE_CELL 1
-// Type 2 (operator from AT+COPS=?) is retired; type 4 replaces it.
-#define TYPE_STATUS 3
-#define TYPE_NETWORK 4
+#define PROTOCOL_VERSION 2  // v1 was one 31-byte legacy advert per record
+#define SNAP_MAX_CELLS 8
+#define SNAP_MAX_NETS 6
+#define SNAP_MAX_BYTES 232  // 24 header+status, 1+9+8*9 cells, 1+6*19 networks
 
 #define MODEM_STARTING 0
 #define MODEM_NO_SIM 1
@@ -72,7 +81,7 @@
 
 #define MAX_CELLS 12
 #define MAX_NETWORKS 8
-#define NET_NAME_LEN 9  // longest name that fits in a 31-byte advert
+#define NET_NAME_LEN 9  // keeps the snapshot inside one extended advert PDU
 
 struct Cell {
   uint16_t mcc, mnc;
@@ -96,12 +105,9 @@ struct Network {
 
 static Cell cells[MAX_CELLS];
 static int numCells = 0;
-static uint8_t cellSeq = 0;
 static Network nets[MAX_NETWORKS];
 static int numNets = 0;
-static uint8_t netSeq = 0;
 static SemaphoreHandle_t dataLock;
-static BLEAdvertising *adv;
 
 // Modem status, written by the modem task and read when building adverts.
 static volatile uint8_t modemState = MODEM_STARTING;
@@ -113,7 +119,6 @@ static volatile uint8_t modemHardResets = 0;  // GPIO9 resets
 static volatile uint8_t dataState = DATA_UNKNOWN;
 static volatile unsigned long lastDataOk = 0;  // millis(), 0 = never
 static volatile uint16_t dataLatencyMs = 0;    // NTP round trip of the last good check
-static uint8_t statusSeq = 0;
 
 // Modem health, only touched by the modem task.
 static int atTimeouts = 0;
@@ -301,7 +306,6 @@ void scanCells() {
   xSemaphoreTake(dataLock, portMAX_DELAY);
   memcpy(cells, found, sizeof(Cell) * n);
   numCells = n;
-  cellSeq++;
   xSemaphoreGive(dataLock);
   if (n > 0) lastCellOk = millis();
 
@@ -379,7 +383,6 @@ bool scanNetworks() {
   xSemaphoreTake(dataLock, portMAX_DELAY);
   memcpy(nets, found, sizeof(Network) * n);
   numNets = n;
-  netSeq++;
   xSemaphoreGive(dataLock);
   if (n > 0) lastNetOk = millis();
 
@@ -452,7 +455,6 @@ bool checkData() {
 
 void clearCells() {
   xSemaphoreTake(dataLock, portMAX_DELAY);
-  if (numCells) cellSeq++;
   numCells = 0;
   xSemaphoreGive(dataLock);
 }
@@ -580,52 +582,9 @@ void modemTask(void *) {
 
 // ---------- BLE ----------
 
-int writeHeader(uint8_t *p, uint8_t type, uint8_t seq, uint8_t idx, uint8_t total) {
-  p[0] = COMPANY_ID & 0xFF;
-  p[1] = COMPANY_ID >> 8;
-  p[2] = MAGIC0;
-  p[3] = MAGIC1;
-  p[4] = type;
-  p[5] = seq;
-  p[6] = idx;
-  p[7] = total;
-  return 8;
-}
-
 void put16(uint8_t *p, uint16_t v) {
   p[0] = v & 0xFF;
   p[1] = v >> 8;
-}
-
-int buildCellPacket(uint8_t *p, int idx) {
-  const Cell &c = cells[idx];
-  int i = writeHeader(p, TYPE_CELL, cellSeq, idx, numCells);
-  put16(p + i, c.mcc); i += 2;
-  put16(p + i, c.mnc); i += 2;
-  p[i++] = (c.kind & 0x03) | (c.mnc3 ? 0x04 : 0) | (c.tdd ? 0x08 : 0);
-  p[i++] = c.band;
-  put16(p + i, c.earfcn); i += 2;
-  put16(p + i, c.pci); i += 2;
-  p[i++] = (uint8_t)c.rsrp;
-  p[i++] = (uint8_t)c.rsrq;
-  p[i++] = (uint8_t)c.sinr;
-  for (int b = 0; b < 4; b++) p[i++] = (c.cellId >> (8 * b)) & 0xFF;
-  return i;  // 25 bytes
-}
-
-int buildNetworkPacket(uint8_t *p, int idx) {
-  const Network &nw = nets[idx];
-  int i = writeHeader(p, TYPE_NETWORK, netSeq, idx, numNets);
-  put16(p + i, nw.mcc); i += 2;
-  put16(p + i, nw.mnc); i += 2;
-  p[i++] = nw.flags;
-  p[i++] = (uint8_t)nw.rsrp4g;
-  p[i++] = nw.band4g;
-  p[i++] = nw.cells4g;
-  p[i++] = (uint8_t)nw.rssi2g;
-  int len = strlen(nw.name);
-  memcpy(p + i, nw.name, len);
-  return i + len;  // up to 26 bytes
 }
 
 uint16_t ageSeconds(unsigned long t, unsigned long now) {
@@ -633,9 +592,20 @@ uint16_t ageSeconds(unsigned long t, unsigned long now) {
   return (uint16_t)min((now - t) / 1000, 0xFFFEUL);
 }
 
-int buildStatusPacket(uint8_t *p) {
+// Builds one snapshot (status, cells, networks) in the protocol v2 layout
+// described in README.md. Returns its length, at most ~221 bytes.
+int buildSnapshot(uint8_t *p) {
+  static uint8_t snapshotSeq = 0;
   unsigned long now = millis();
-  int i = writeHeader(p, TYPE_STATUS, statusSeq++, 0, 1);
+  int i = 0;
+
+  put16(p + i, COMPANY_ID); i += 2;
+  p[i++] = MAGIC0;
+  p[i++] = MAGIC1;
+  p[i++] = PROTOCOL_VERSION;
+  p[i++] = snapshotSeq++;
+
+  // Status (18 bytes).
   p[i++] = modemState;
   p[i++] = netScanRunning ? STATUS_FLAG_NET_SCAN : 0;
   p[i++] = csq;
@@ -648,16 +618,86 @@ int buildStatusPacket(uint8_t *p) {
   p[i++] = dataState;
   put16(p + i, ageSeconds(lastDataOk, now)); i += 2;
   put16(p + i, dataLatencyMs); i += 2;
-  return i;  // 26 bytes, the most a legacy advert can carry
+
+  xSemaphoreTake(dataLock, portMAX_DELAY);
+
+  // Cells: all share the serving operator, so MCC/MNC and the serving cell
+  // ID are sent once. Serving cell first, then the strongest neighbours.
+  Cell sorted[MAX_CELLS];
+  memcpy(sorted, cells, sizeof(Cell) * numCells);
+  std::sort(sorted, sorted + numCells, [](const Cell &a, const Cell &b) {
+    if ((a.kind == KIND_SERVING) != (b.kind == KIND_SERVING)) return a.kind == KIND_SERVING;
+    return a.rsrp > b.rsrp;
+  });
+  int nc = min(numCells, SNAP_MAX_CELLS);
+  p[i++] = nc;
+  if (nc > 0) {
+    put16(p + i, sorted[0].mcc); i += 2;
+    put16(p + i, sorted[0].mnc); i += 2;
+    p[i++] = sorted[0].mnc3 ? NET_FLAG_MNC3 : 0;
+    uint32_t servingId = sorted[0].kind == KIND_SERVING ? sorted[0].cellId : 0;
+    for (int b = 0; b < 4; b++) p[i++] = (servingId >> (8 * b)) & 0xFF;
+    for (int k = 0; k < nc; k++) {
+      const Cell &c = sorted[k];
+      p[i++] = (c.kind & 0x03) | (c.tdd ? 0x08 : 0);
+      p[i++] = c.band;
+      put16(p + i, c.earfcn); i += 2;
+      put16(p + i, c.pci); i += 2;
+      p[i++] = (uint8_t)c.rsrp;
+      p[i++] = (uint8_t)c.rsrq;
+      p[i++] = (uint8_t)c.sinr;
+    }
+  }
+
+  // Networks.
+  int nn = min(numNets, SNAP_MAX_NETS);
+  p[i++] = nn;
+  for (int k = 0; k < nn; k++) {
+    const Network &nw = nets[k];
+    put16(p + i, nw.mcc); i += 2;
+    put16(p + i, nw.mnc); i += 2;
+    p[i++] = nw.flags;
+    p[i++] = (uint8_t)nw.rsrp4g;
+    p[i++] = nw.band4g;
+    p[i++] = nw.cells4g;
+    p[i++] = (uint8_t)nw.rssi2g;
+    int len = strlen(nw.name);
+    p[i++] = len;
+    memcpy(p + i, nw.name, len);
+    i += len;
+  }
+
+  xSemaphoreGive(dataLock);
+  return i;
 }
 
+// Replaces the advertised snapshot. Restarting the instance keeps the update
+// atomic; the gap is a few milliseconds.
 void advertise(const uint8_t *data, int len) {
-  BLEAdvertisementData ad;
-  ad.setFlags(0x06);  // LE general discoverable, BR/EDR not supported
-  ad.setManufacturerData(String((const char *)data, len));
-  adv->stop();
-  adv->setAdvertisementData(ad);
-  adv->start();
+  NimBLEExtAdvertisement ad(BLE_HCI_LE_PHY_1M, BLE_HCI_LE_PHY_1M);
+  ad.setLegacyAdvertising(false);  // BLE 5 extended advert: room for the whole snapshot
+  ad.setConnectable(false);
+  ad.setScannable(false);
+  ad.setTxPower(TX_POWER_DBM);
+  ad.setMinInterval(ADV_INTERVAL_UNITS);
+  ad.setMaxInterval(ADV_INTERVAL_UNITS);
+  ad.setManufacturerData(data, len);
+
+  NimBLEExtAdvertising *ext = NimBLEDevice::getAdvertising();
+  ext->stop(0);
+  if (!ext->setInstanceData(0, ad) || !ext->start(0)) {
+    Serial.println("Extended advertising update failed");
+  }
+  // NimBLEDevice::setPower() covers legacy states; an extended advertising
+  // set has its own power, so set it on instance 0 directly.
+  esp_ble_tx_power_set_enhanced(ESP_BLE_ENHANCED_PWR_TYPE_ADV, 0, ESP_PWR_LVL_P20);
+}
+
+// TX power of advertising instance 0 in dBm, as the controller reports it.
+int advertPowerDbm() {
+  int level = esp_ble_tx_power_get_enhanced(ESP_BLE_ENHANCED_PWR_TYPE_ADV, 0);
+  if (level < 0) return -128;
+  return min((level - ESP_PWR_LVL_N0) * 3, 20);
 }
 
 void setup() {
@@ -668,16 +708,8 @@ void setup() {
 
   dataLock = xSemaphoreCreateMutex();
 
-  BLEDevice::init("7Semi-LTE");
-  adv = BLEDevice::getAdvertising();
-#if defined(CONFIG_NIMBLE_ENABLED)  // core 3.3+ builds the S3 with NimBLE
-  adv->setAdvertisementType(BLE_GAP_CONN_MODE_NON);
-#else
-  adv->setAdvertisementType(ADV_TYPE_NONCONN_IND);
-#endif
-  adv->setMinInterval(0xA0);  // 100 ms (units of 0.625 ms)
-  adv->setMaxInterval(0xB0);
-  adv->setScanResponse(false);
+  NimBLEDevice::init("7Semi-LTE");
+  NimBLEDevice::setPower(TX_POWER_DBM);
 
   // Restart the ESP32 if the modem task or this loop stops checking in.
   esp_task_wdt_config_t wdt = {
@@ -697,22 +729,16 @@ void setup() {
 }
 
 void loop() {
-  static int slot = 0;
-  uint8_t pkt[26];
-  int len;
-
-  // Rotation: status first, then cells, then networks. Status is always
-  // sent, so the display knows the beacon is alive even with no data.
-  xSemaphoreTake(dataLock, portMAX_DELAY);
-  int total = 1 + numCells + numNets;
-  slot %= total;
-  if (slot == 0) len = buildStatusPacket(pkt);
-  else if (slot <= numCells) len = buildCellPacket(pkt, slot - 1);
-  else len = buildNetworkPacket(pkt, slot - 1 - numCells);
-  xSemaphoreGive(dataLock);
-
-  advertise(pkt, len);
-  slot++;
+  // A fresh snapshot every second: data ages stay current, and any change
+  // reaches the display within a second.
+  static unsigned long lastLog = 0;
+  uint8_t snap[SNAP_MAX_BYTES];
+  int len = buildSnapshot(snap);
+  advertise(snap, len);
+  if (lastLog == 0 || millis() - lastLog >= 60000) {
+    lastLog = millis();
+    Serial.printf("BLE: snapshot %d bytes, advert TX power %d dBm\n", len, advertPowerDbm());
+  }
   esp_task_wdt_reset();
-  delay(ADV_DWELL_MS);
+  delay(SNAPSHOT_INTERVAL_MS);
 }
