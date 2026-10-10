@@ -1,13 +1,14 @@
 // 7Semi ESP32-S3 EC200U: LTE network scanner -> BLE beacon.
 // The EC200U reports the serving LTE cell and its neighbour cells
-// (AT+QENG) plus the operators it can see (AT+COPS=?). The ESP32-S3 packs
-// each result into a BLE advertisement and rotates through them, together
-// with a status advert describing the modem's state.
+// (AT+QENG) plus every operator in range with its cells' signal (AT+QOPS).
+// The ESP32-S3 packs each result into a BLE advertisement and rotates
+// through them, together with a status advert describing the modem's state.
 // LTE_Scanner_Display (LilyGO T-Display-S3) listens for these adverts.
 //
 // Reliability: waits for the modem (AT, SIM, registration) before scanning,
-// re-initialises it if it reboots ("RDY") or stops answering, and a task
-// watchdog restarts the ESP32 if the modem task or advert loop hangs.
+// re-initialises it if it reboots ("RDY") or stops answering, hard-resets it
+// through GPIO9 if it won't answer at all, and a task watchdog restarts the
+// ESP32 if the modem task or advert loop hangs.
 //
 // Built for Arduino-ESP32 core 3.x (its built-in BLE library).
 // Advert format: see README.md "BLE advert format".
@@ -20,10 +21,12 @@
 #define MODEM_RX_PIN 12  // ESP32 RX <- EC200U TX (manual says 16; measured 12)
 #define MODEM_TX_PIN 13  // ESP32 TX -> EC200U RX (manual says 17; measured 13)
 #define MODEM_BAUD 115200
+#define MODEM_RESET_PIN 9  // HIGH pulse resets the EC200U (found with Reset_Probe)
+#define RESET_PULSE_MS 300
 
 #define CELL_SCAN_INTERVAL_MS 5000
-#define OPERATOR_SCAN_INTERVAL_MS (10UL * 60 * 1000)
-#define OPERATOR_RETRY_MS (60UL * 1000)
+#define NETWORK_SCAN_INTERVAL_MS (3UL * 60 * 1000)  // AT+QOPS takes ~40 s
+#define NETWORK_RETRY_MS (60UL * 1000)
 #define ADV_DWELL_MS 500  // how long each record is advertised
 #define WDT_TIMEOUT_MS 30000
 #define MAX_AT_TIMEOUTS 3  // consecutive timeouts before re-initialising the modem
@@ -32,8 +35,9 @@
 #define MAGIC0 '7'
 #define MAGIC1 'S'
 #define TYPE_CELL 1
-#define TYPE_OPERATOR 2
+// Type 2 (operator from AT+COPS=?) is retired; type 4 replaces it.
 #define TYPE_STATUS 3
+#define TYPE_NETWORK 4
 
 #define MODEM_STARTING 0
 #define MODEM_NO_SIM 1
@@ -41,15 +45,22 @@
 #define MODEM_REGISTERED 3
 #define MODEM_NOT_RESPONDING 4
 
-#define STATUS_FLAG_OPS_SCAN 0x01  // AT+COPS=? in progress
+#define STATUS_FLAG_NET_SCAN 0x01  // AT+QOPS in progress
+
+#define NET_FLAG_MNC3 0x04
+#define NET_FLAG_4G 0x10
+#define NET_FLAG_3G 0x20
+#define NET_FLAG_2G 0x40
 
 #define KIND_SERVING 0
 #define KIND_INTRA 1  // neighbour on the same frequency
 #define KIND_INTER 2  // neighbour on another frequency
 
+#define SINR_UNKNOWN -128
+
 #define MAX_CELLS 12
-#define MAX_OPERATORS 8
-#define OP_NAME_LEN 11  // longest name that fits in a 31-byte advert
+#define MAX_NETWORKS 8
+#define NET_NAME_LEN 9  // longest name that fits in a 31-byte advert
 
 struct Cell {
   uint16_t mcc, mnc;
@@ -60,28 +71,33 @@ struct Cell {
   uint32_t cellId;
 };
 
-struct Operator {
+// One operator from AT+QOPS, summarised to its strongest cells.
+struct Network {
   uint16_t mcc, mnc;
-  bool mnc3;
-  uint8_t stat, act;  // 3GPP 27.007: stat 1=available 2=current 3=forbidden, act 7=LTE
-  char name[OP_NAME_LEN + 1];
+  uint8_t flags;          // NET_FLAG_*
+  int8_t rsrp4g;          // strongest 4G cell RSRP, 0 = none
+  uint8_t band4g;         // band of that cell
+  uint8_t cells4g;        // distinct 4G cells seen
+  int8_t rssi2g;          // strongest 2G cell RSSI, 0 = none
+  char name[NET_NAME_LEN + 1];
 };
 
 static Cell cells[MAX_CELLS];
 static int numCells = 0;
 static uint8_t cellSeq = 0;
-static Operator ops[MAX_OPERATORS];
-static int numOps = 0;
-static uint8_t opSeq = 0;
+static Network nets[MAX_NETWORKS];
+static int numNets = 0;
+static uint8_t netSeq = 0;
 static SemaphoreHandle_t dataLock;
 static BLEAdvertising *adv;
 
 // Modem status, written by the modem task and read when building adverts.
 static volatile uint8_t modemState = MODEM_STARTING;
 static volatile uint8_t csq = 99;  // 99 = unknown
-static volatile bool opsScanRunning = false;
-static volatile unsigned long lastCellOk = 0, lastOpsOk = 0;  // millis(), 0 = never
-static volatile uint8_t modemRecoveries = 0;
+static volatile bool netScanRunning = false;
+static volatile unsigned long lastCellOk = 0, lastNetOk = 0;  // millis(), 0 = never
+static volatile uint8_t modemRecoveries = 0;  // soft re-initialisations
+static volatile uint8_t modemHardResets = 0;  // GPIO9 resets
 static uint8_t statusSeq = 0;
 
 // Modem health, only touched by the modem task.
@@ -171,6 +187,12 @@ int8_t clamp8(long v) {
   return (int8_t)constrain(v, -128, 127);
 }
 
+// The EC200U reports SINR as X where dB = X / 2 - 23.5 (AT manual, AT+QCSQ;
+// AT+QENG's raw values track AT+QCSQ's, so the same scale is assumed).
+int8_t sinrToDb(long raw) {
+  return clamp8(lround(raw / 2.0 - 23.5));
+}
+
 // LTE bands supported by the EC200U-CN.
 uint8_t earfcnToBand(uint32_t e) {
   static const struct { uint8_t band; uint32_t lo, hi; } table[] = {
@@ -223,7 +245,7 @@ void scanCells() {
     if (c.band == 0) c.band = earfcnToBand(c.earfcn);
     c.rsrp = clamp8(f[i + 11].toInt());
     c.rsrq = clamp8(f[i + 12].toInt());
-    c.sinr = clamp8(f[i + 14].toInt());
+    c.sinr = sinrToDb(f[i + 14].toInt());
   });
 
   if (n == 0) {
@@ -248,7 +270,9 @@ void scanCells() {
       if (a < -40) { long t = a; a = b; b = t; }
       c.rsrq = clamp8(a);
       c.rsrp = clamp8(b);
-      c.sinr = nf > i + 6 ? clamp8(f[i + 6].toInt()) : 0;
+      // The field after RSSI looks like SINR but stays fixed per cell while
+      // RSRP moves, so it isn't a live reading; report SINR as unknown.
+      c.sinr = SINR_UNKNOWN;
       c.band = earfcnToBand(c.earfcn);
       c.tdd = c.band >= 33;
       c.cellId = 0;
@@ -274,49 +298,80 @@ void scanCells() {
   }
 }
 
-bool scanOperators() {
-  Serial.println("Scanning operators (AT+COPS=?), this takes up to 3 minutes...");
-  // +COPS: (2,"Airtel","Airtel","40445",7),(1,"Jio 4G","Jio 4G","405857",7),,(0-4),(0-2)
-  String resp = sendAT("AT+COPS=?", 180000);
-  int p = resp.indexOf("+COPS:");
-  if (p < 0) {
-    Serial.println("COPS scan failed: " + resp);
+// Scans every operator in range with AT+QOPS (~40 s) and keeps, per operator,
+// its strongest 4G cell, how many distinct 4G cells it has, and its strongest
+// 2G cell. Output, one header per operator followed by its cells:
+//   +QOPS: "O2 - UK","O2 - UK","23410"
+//   1,"2G",120,5564,9727,25,-55,50,-,1          <arfcn>,<lac>,<ci>,<bsic>,<rssi>,...
+//   6,"4G",347,215,8650,7B04573,-90,-14,-       <earfcn>,<pci>,<tac>,<ci>,<rsrp>,<rsrq>,...
+bool scanNetworks() {
+  Serial.println("Scanning networks (AT+QOPS), this takes about 40 s...");
+  String resp = sendAT("AT+QOPS", 180000);
+  if (resp.indexOf("+QOPS:") < 0) {
+    Serial.println("QOPS scan failed: " + resp);
     return false;
   }
 
-  Operator found[MAX_OPERATORS];
+  Network found[MAX_NETWORKS];
+  uint32_t seen4g[MAX_NETWORKS][16];  // earfcn << 16 | pci, to count distinct cells
   int n = 0;
-  int open;
-  while (n < MAX_OPERATORS && (open = resp.indexOf('(', p)) >= 0) {
-    int close = resp.indexOf(')', open);
-    if (close < 0) break;
-    String group = resp.substring(open + 1, close);
-    p = close + 1;
-    if (group.indexOf('"') < 0) continue;  // trailing (0-4),(0-2) ranges
+  Network *cur = nullptr;
 
-    String f[5];
-    if (splitCsv(group, f, 5) < 5 || f[3].length() < 5) continue;
-    Operator &o = found[n++];
-    o.stat = f[0].toInt();
-    o.mcc = f[3].substring(0, 3).toInt();
-    o.mnc = f[3].substring(3).toInt();
-    o.mnc3 = f[3].length() >= 6;
-    o.act = f[4].toInt();
-    const String &name = f[2].length() ? f[2] : f[1];
-    strncpy(o.name, name.c_str(), OP_NAME_LEN);
-    o.name[OP_NAME_LEN] = '\0';
-  }
+  forEachLine(resp, "", [&](const String &line) {
+    if (line.startsWith("+QOPS:")) {
+      cur = nullptr;
+      String f[3];
+      if (splitCsv(line.substring(6), f, 3) < 3 || f[2].length() < 5 || n >= MAX_NETWORKS) return;
+      cur = &found[n++];
+      memset(cur, 0, sizeof(Network));
+      cur->mcc = f[2].substring(0, 3).toInt();
+      cur->mnc = f[2].substring(3).toInt();
+      if (f[2].length() >= 6) cur->flags |= NET_FLAG_MNC3;
+      // Prefer the short name; some operators report none, so fall back to MCC-MNC.
+      String name = f[1].length() ? f[1] : f[0].length() ? f[0] : f[2].substring(0, 3) + "-" + f[2].substring(3);
+      strncpy(cur->name, name.c_str(), NET_NAME_LEN);
+      cur->name[NET_NAME_LEN] = '\0';
+      return;
+    }
+    if (!cur || line.length() == 0 || !isDigit(line[0])) return;
+
+    String f[10];
+    int nf = splitCsv(line, f, 10);
+    if (nf < 7) return;
+    if (f[1] == "4G" && nf >= 8) {
+      long rsrp = f[6].toInt();
+      if (rsrp < -140 || rsrp > -44) return;
+      uint32_t key = ((uint32_t)f[2].toInt() << 16) | (f[3].toInt() & 0xFFFF);
+      uint32_t *keys = seen4g[cur - found];
+      bool dup = false;
+      for (int k = 0; k < cur->cells4g; k++) dup |= keys[k] == key;
+      if (!dup && cur->cells4g < 16) keys[cur->cells4g++] = key;
+      cur->flags |= NET_FLAG_4G;
+      if (cur->rsrp4g == 0 || rsrp > cur->rsrp4g) {
+        cur->rsrp4g = rsrp;
+        cur->band4g = earfcnToBand(f[2].toInt());
+      }
+    } else if (f[1] == "3G") {
+      cur->flags |= NET_FLAG_3G;
+    } else if (f[1] == "2G") {
+      long rssi = f[6].toInt();
+      cur->flags |= NET_FLAG_2G;
+      if (rssi < -120 || rssi > -20) return;
+      if (cur->rssi2g == 0 || rssi > cur->rssi2g) cur->rssi2g = rssi;
+    }
+  });
 
   xSemaphoreTake(dataLock, portMAX_DELAY);
-  memcpy(ops, found, sizeof(Operator) * n);
-  numOps = n;
-  opSeq++;
+  memcpy(nets, found, sizeof(Network) * n);
+  numNets = n;
+  netSeq++;
   xSemaphoreGive(dataLock);
-  if (n > 0) lastOpsOk = millis();
+  if (n > 0) lastNetOk = millis();
 
   for (int k = 0; k < n; k++) {
-    Serial.printf("OP %-11s %u-%0*u stat %u act %u\n", found[k].name, found[k].mcc,
-                  found[k].mnc3 ? 3 : 2, found[k].mnc, found[k].stat, found[k].act);
+    const Network &nw = found[k];
+    Serial.printf("NET %-9s %u-%0*u 4G: %d dBm B%u (%u cells)  2G: %d dBm\n", nw.name, nw.mcc,
+                  (nw.flags & NET_FLAG_MNC3) ? 3 : 2, nw.mnc, nw.rsrp4g, nw.band4g, nw.cells4g, nw.rssi2g);
   }
   return n > 0;
 }
@@ -328,14 +383,38 @@ void clearCells() {
   xSemaphoreGive(dataLock);
 }
 
+// Pulses the modem's hardware reset line, then waits for the RDY it prints
+// ~4 s later. The modem can answer AT slightly before RDY, so without this
+// wait the late RDY would look like a second, unexpected reboot.
+void modemHardReset() {
+  Serial.println("Hard-resetting modem (GPIO9)");
+  digitalWrite(MODEM_RESET_PIN, HIGH);
+  vTaskDelay(pdMS_TO_TICKS(RESET_PULSE_MS));
+  digitalWrite(MODEM_RESET_PIN, LOW);
+  modemHardResets++;
+
+  modemRebooted = false;
+  unsigned long start = millis();
+  while (!modemRebooted && millis() - start < 15000) drainModem(100);
+  Serial.println(modemRebooted ? "Modem sent RDY" : "No RDY after reset");
+  modemRebooted = false;
+}
+
 // Waits for the modem to answer AT (it takes ~10 s after power-up), then
-// applies the settings a modem reboot would have reset.
+// applies the settings a modem reboot would have reset. If it never answers,
+// hard-resets it and waits once more.
 bool modemInit() {
   modemState = MODEM_STARTING;
   Serial.println("Waiting for modem...");
   bool alive = false;
-  for (int i = 0; i < 20 && !alive; i++) {
-    alive = sendAT("AT", 1000).indexOf("OK") >= 0;
+  for (int attempt = 0; attempt < 2 && !alive; attempt++) {
+    if (attempt == 1) {
+      modemState = MODEM_NOT_RESPONDING;
+      modemHardReset();
+    }
+    for (int i = 0; i < 20 && !alive; i++) {
+      alive = sendAT("AT", 1000).indexOf("OK") >= 0;
+    }
   }
   if (!alive) {
     modemState = MODEM_NOT_RESPONDING;
@@ -376,8 +455,8 @@ bool updateStatus() {
 void modemTask(void *) {
   esp_task_wdt_add(NULL);
   bool ready = false;
-  bool haveOps = false;
-  unsigned long lastOpsAttempt = 0;
+  bool haveNets = false;
+  unsigned long lastNetAttempt = 0;
 
   for (;;) {
     esp_task_wdt_reset();
@@ -394,12 +473,12 @@ void modemTask(void *) {
 
     if (updateStatus()) {
       scanCells();
-      unsigned long wait = haveOps ? OPERATOR_SCAN_INTERVAL_MS : OPERATOR_RETRY_MS;
-      if (lastOpsAttempt == 0 || millis() - lastOpsAttempt > wait) {
-        opsScanRunning = true;
-        haveOps = scanOperators();
-        opsScanRunning = false;
-        lastOpsAttempt = millis();
+      unsigned long wait = haveNets ? NETWORK_SCAN_INTERVAL_MS : NETWORK_RETRY_MS;
+      if (lastNetAttempt == 0 || millis() - lastNetAttempt > wait) {
+        netScanRunning = true;
+        haveNets = scanNetworks();
+        netScanRunning = false;
+        lastNetAttempt = millis();
       }
     } else {
       Serial.printf("Modem state %u, not scanning\n", modemState);
@@ -452,17 +531,19 @@ int buildCellPacket(uint8_t *p, int idx) {
   return i;  // 25 bytes
 }
 
-int buildOperatorPacket(uint8_t *p, int idx) {
-  const Operator &o = ops[idx];
-  int i = writeHeader(p, TYPE_OPERATOR, opSeq, idx, numOps);
-  put16(p + i, o.mcc); i += 2;
-  put16(p + i, o.mnc); i += 2;
-  p[i++] = o.mnc3 ? 0x04 : 0;
-  p[i++] = o.stat;
-  p[i++] = o.act;
-  int len = strlen(o.name);
-  memcpy(p + i, o.name, len);
-  return i + len;  // up to 24 bytes
+int buildNetworkPacket(uint8_t *p, int idx) {
+  const Network &nw = nets[idx];
+  int i = writeHeader(p, TYPE_NETWORK, netSeq, idx, numNets);
+  put16(p + i, nw.mcc); i += 2;
+  put16(p + i, nw.mnc); i += 2;
+  p[i++] = nw.flags;
+  p[i++] = (uint8_t)nw.rsrp4g;
+  p[i++] = nw.band4g;
+  p[i++] = nw.cells4g;
+  p[i++] = (uint8_t)nw.rssi2g;
+  int len = strlen(nw.name);
+  memcpy(p + i, nw.name, len);
+  return i + len;  // up to 26 bytes
 }
 
 uint16_t ageSeconds(unsigned long t, unsigned long now) {
@@ -474,14 +555,15 @@ int buildStatusPacket(uint8_t *p) {
   unsigned long now = millis();
   int i = writeHeader(p, TYPE_STATUS, statusSeq++, 0, 1);
   p[i++] = modemState;
-  p[i++] = opsScanRunning ? STATUS_FLAG_OPS_SCAN : 0;
+  p[i++] = netScanRunning ? STATUS_FLAG_NET_SCAN : 0;
   p[i++] = csq;
   put16(p + i, ageSeconds(lastCellOk, now)); i += 2;
-  put16(p + i, ageSeconds(lastOpsOk, now)); i += 2;
+  put16(p + i, ageSeconds(lastNetOk, now)); i += 2;
   uint32_t uptime = now / 1000;
   for (int b = 0; b < 4; b++) p[i++] = (uptime >> (8 * b)) & 0xFF;
   p[i++] = modemRecoveries;
-  return i;  // 20 bytes
+  p[i++] = modemHardResets;
+  return i;  // 21 bytes
 }
 
 void advertise(const uint8_t *data, int len) {
@@ -521,23 +603,27 @@ void setup() {
   if (esp_task_wdt_reconfigure(&wdt) != ESP_OK) esp_task_wdt_init(&wdt);
   esp_task_wdt_add(NULL);  // setup() and loop() run in the same task
 
+  // Hold the reset line released (LOW) rather than leaving it floating.
+  pinMode(MODEM_RESET_PIN, OUTPUT);
+  digitalWrite(MODEM_RESET_PIN, LOW);
+
   // All modem I/O happens in its own task, including start-up.
   xTaskCreatePinnedToCore(modemTask, "modem", 12288, nullptr, 1, nullptr, 1);
 }
 
 void loop() {
   static int slot = 0;
-  uint8_t pkt[25];
+  uint8_t pkt[26];
   int len;
 
-  // Rotation: status first, then cells, then operators. Status is always
+  // Rotation: status first, then cells, then networks. Status is always
   // sent, so the display knows the beacon is alive even with no data.
   xSemaphoreTake(dataLock, portMAX_DELAY);
-  int total = 1 + numCells + numOps;
+  int total = 1 + numCells + numNets;
   slot %= total;
   if (slot == 0) len = buildStatusPacket(pkt);
   else if (slot <= numCells) len = buildCellPacket(pkt, slot - 1);
-  else len = buildOperatorPacket(pkt, slot - 1 - numCells);
+  else len = buildNetworkPacket(pkt, slot - 1 - numCells);
   xSemaphoreGive(dataLock);
 
   advertise(pkt, len);

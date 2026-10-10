@@ -20,22 +20,26 @@
 #define MAGIC0 '7'
 #define MAGIC1 'S'
 #define TYPE_CELL 1
-#define TYPE_OPERATOR 2
 #define TYPE_STATUS 3
+#define TYPE_NETWORK 4
+
+#define NET_FLAG_4G 0x10
+#define NET_FLAG_3G 0x20
+#define NET_FLAG_2G 0x40
 
 #define MODEM_STARTING 0
 #define MODEM_NO_SIM 1
 #define MODEM_SEARCHING 2
 #define MODEM_REGISTERED 3
 #define MODEM_NOT_RESPONDING 4
-#define STATUS_FLAG_OPS_SCAN 0x01
+#define STATUS_FLAG_NET_SCAN 0x01  // AT+QOPS in progress
 
 #define KIND_SERVING 0
 #define KIND_INTRA 1
 #define KIND_INTER 2
 
 #define MAX_CELLS 16
-#define MAX_OPERATORS 8
+#define MAX_NETWORKS 8
 #define EXPIRE_MS 30000  // drop records the beacon stopped sending
 #define STALE_MS 5000    // beacon counts as lost after this long without adverts
 #define CELL_STALE_S 15  // serving cell readout dims when older than this
@@ -121,20 +125,23 @@ struct CellRx {
   unsigned long seen;
 };
 
-struct OpRx {
+// One operator from the beacon's AT+QOPS scan, summarised to its best cells.
+struct NetRx {
   bool used;
   uint16_t mcc, mnc;
-  bool mnc3;
-  uint8_t stat, act;
-  char name[12];
+  uint8_t flags;    // NET_FLAG_*
+  int8_t rsrp4g;    // strongest 4G cell RSRP, 0 = none
+  uint8_t band4g;
+  uint8_t cells4g;  // distinct 4G cells
+  int8_t rssi2g;    // strongest 2G cell RSSI, 0 = none
+  char name[10];
   unsigned long seen;
 };
 
-// One row of the networks panel: an operator with all its technologies merged.
+// One row of the networks panel.
 struct Network {
-  uint16_t mcc, mnc;
-  char name[12];
-  bool current, has4g, has3g, has2g;
+  NetRx net;
+  bool current;  // the network the beacon's SIM is registered on
 };
 
 struct Quality {
@@ -145,14 +152,14 @@ struct Quality {
 
 struct StatusRx {
   bool valid;
-  uint8_t state, flags, csq, recoveries;
-  uint16_t cellAge, opsAge;  // seconds when sent, 0xFFFF = never
+  uint8_t state, flags, csq, recoveries, hardResets;
+  uint16_t cellAge, netAge;  // seconds when sent, 0xFFFF = never
   uint32_t uptime;
   unsigned long seen;
 };
 
 static CellRx cells[MAX_CELLS];
-static OpRx ops[MAX_OPERATORS];
+static NetRx netTable[MAX_NETWORKS];
 static StatusRx beaconStatus;
 static int beaconRssi = 0;
 static unsigned long lastPacket = 0;
@@ -177,14 +184,14 @@ int cellSlot(uint16_t earfcn, uint16_t pci) {
   return oldest;
 }
 
-int opSlot(uint16_t mcc, uint16_t mnc, uint8_t act) {
+int netSlot(uint16_t mcc, uint16_t mnc) {
   int oldest = 0;
-  for (int i = 0; i < MAX_OPERATORS; i++) {
-    if (ops[i].used && ops[i].mcc == mcc && ops[i].mnc == mnc && ops[i].act == act) return i;
+  for (int i = 0; i < MAX_NETWORKS; i++) {
+    if (netTable[i].used && netTable[i].mcc == mcc && netTable[i].mnc == mnc) return i;
   }
-  for (int i = 0; i < MAX_OPERATORS; i++) {
-    if (!ops[i].used) return i;
-    if (ops[i].seen < ops[oldest].seen) oldest = i;
+  for (int i = 0; i < MAX_NETWORKS; i++) {
+    if (!netTable[i].used) return i;
+    if (netTable[i].seen < netTable[oldest].seen) oldest = i;
   }
   return oldest;
 }
@@ -221,33 +228,36 @@ class BeaconCallbacks : public BLEAdvertisedDeviceCallbacks {
       beaconRssi = dev.getRSSI();
       lastPacket = now;
       portEXIT_CRITICAL(&dataMux);
-    } else if (type == TYPE_OPERATOR && n >= 15) {
-      OpRx o;
-      o.used = true;
-      o.mcc = get16(d + 8);
-      o.mnc = get16(d + 10);
-      o.mnc3 = d[12] & 0x04;
-      o.stat = d[13];
-      o.act = d[14];
-      size_t len = min(n - 15, sizeof(o.name) - 1);
-      memcpy(o.name, d + 15, len);
-      o.name[len] = '\0';
-      o.seen = now;
+    } else if (type == TYPE_NETWORK && n >= 17) {
+      NetRx w;
+      w.used = true;
+      w.mcc = get16(d + 8);
+      w.mnc = get16(d + 10);
+      w.flags = d[12];
+      w.rsrp4g = (int8_t)d[13];
+      w.band4g = d[14];
+      w.cells4g = d[15];
+      w.rssi2g = (int8_t)d[16];
+      size_t len = min(n - 17, sizeof(w.name) - 1);
+      memcpy(w.name, d + 17, len);
+      w.name[len] = '\0';
+      w.seen = now;
       portENTER_CRITICAL(&dataMux);
-      ops[opSlot(o.mcc, o.mnc, o.act)] = o;
+      netTable[netSlot(w.mcc, w.mnc)] = w;
       beaconRssi = dev.getRSSI();
       lastPacket = now;
       portEXIT_CRITICAL(&dataMux);
-    } else if (type == TYPE_STATUS && n >= 20) {
+    } else if (type == TYPE_STATUS && n >= 21) {
       StatusRx s;
       s.valid = true;
       s.state = d[8];
       s.flags = d[9];
       s.csq = d[10];
       s.cellAge = get16(d + 11);
-      s.opsAge = get16(d + 13);
+      s.netAge = get16(d + 13);
       s.uptime = d[15] | (d[16] << 8) | (d[17] << 16) | ((uint32_t)d[18] << 24);
       s.recoveries = d[19];
+      s.hardResets = d[20];
       s.seen = now;
       portENTER_CRITICAL(&dataMux);
       beaconStatus = s;
@@ -369,7 +379,7 @@ void drawServingCard(const CellRx *serving, const Network *nets, int numNets,
         drawCardMessage(x, y, w, h, "Searching for network", st.csq == 99 ? "no signal" : detail, C_AMBER);
         break;
       default:
-        snprintf(detail, sizeof(detail), "check power - restarts: %u", st.recoveries);
+        snprintf(detail, sizeof(detail), "check power - restarts: %u", st.recoveries + st.hardResets);
         drawCardMessage(x, y, w, h, "Modem not responding", detail, C_RED);
         break;
     }
@@ -390,8 +400,8 @@ void drawServingCard(const CellRx *serving, const Network *nets, int numNets,
   char opName[20];
   snprintf(opName, sizeof(opName), "%u-%0*u", serving->mcc, serving->mnc3 ? 3 : 2, serving->mnc);
   for (int i = 0; i < numNets; i++) {
-    if (nets[i].mcc == serving->mcc && nets[i].mnc == serving->mnc) {
-      strncpy(opName, nets[i].name, sizeof(opName) - 1);
+    if (nets[i].net.mcc == serving->mcc && nets[i].net.mnc == serving->mnc) {
+      strncpy(opName, nets[i].net.name, sizeof(opName) - 1);
       opName[sizeof(opName) - 1] = '\0';
     }
   }
@@ -421,8 +431,11 @@ void drawServingCard(const CellRx *serving, const Network *nets, int numNets,
   drawSignalBars(x + w - 62, y + 64, q.bars, q.color);
 
   // Bottom line: cell details while fresh, a warning once the reading is old.
+  // The modem can't read cells during its ~40 s network scan, so say so.
   char detail[48];
-  if (stale) {
+  if (stale && st.valid && (st.flags & STATUS_FLAG_NET_SCAN)) {
+    snprintf(detail, sizeof(detail), "scanning networks... %lds", cellAge);
+  } else if (stale) {
     snprintf(detail, sizeof(detail), "no update for %lds", cellAge);
   } else {
     snprintf(detail, sizeof(detail), "Band %u   PCI %u   RSRQ %d dB", serving->band, serving->pci, serving->rsrq);
@@ -491,41 +504,57 @@ void drawNetworksCard(const Network *nets, int count, bool scanning) {
       canvas.drawString(more, x + 9, ry + 2);
       break;
     }
-    const Network &n = nets[i];
+    const NetRx &n = nets[i].net;
+    bool current = nets[i].current;
 
-    char tech[12] = "";
-    if (n.has4g) strcat(tech, "4G ");
-    if (n.has3g) strcat(tech, "3G ");
-    if (n.has2g) strcat(tech, "2G ");
-    if (tech[0]) tech[strlen(tech) - 1] = '\0';
-    canvas.setFont(&fonts::DejaVu9);
-    canvas.setTextColor(n.has4g ? C_ACCENT : C_DIM);
+    // Right: strongest 4G RSRP coloured by quality, or the 2G level if the
+    // operator has no 4G here.
+    char value[12];
+    uint16_t valueColor;
+    int barRsrp = -140;
     canvas.setTextDatum(textdatum_t::top_right);
-    int tw = canvas.drawString(tech, x + w - 7, ry + 2);
+    if (n.rsrp4g) {
+      snprintf(value, sizeof(value), "%d", n.rsrp4g);
+      valueColor = rsrpQuality(n.rsrp4g).color;
+      barRsrp = n.rsrp4g;
+      canvas.setFont(&fonts::DejaVu12);
+    } else {
+      snprintf(value, sizeof(value), n.rssi2g ? "2G %d" : "--", n.rssi2g);
+      valueColor = C_DIM;
+      canvas.setFont(&fonts::DejaVu9);
+    }
+    canvas.setTextColor(valueColor);
+    int vw = canvas.drawString(value, x + w - 7, ry);
 
-    canvas.fillSmoothCircle(x + 11, ry + 6, 3, n.current ? C_GREEN : C_FAINT);
+    canvas.fillSmoothCircle(x + 11, ry + 6, 3, current ? C_GREEN : C_FAINT);
     canvas.setFont(&fonts::DejaVu12);
     char fitted[12];
-    fitText(n.name, fitted, sizeof(fitted), w - 30 - tw);
-    canvas.setTextColor(n.current ? C_GREEN : C_TEXT);
+    fitText(n.name, fitted, sizeof(fitted), w - 30 - vw);
+    canvas.setTextColor(current ? C_GREEN : C_TEXT);
     canvas.setTextDatum(textdatum_t::top_left);
     canvas.drawString(fitted, x + 19, ry);
+
+    // Thin signal bar under the name: RSRP -140 (empty) .. -44 dBm (full).
+    const int bx = x + 19, bw = w - 26;
+    canvas.fillRect(bx, ry + 15, bw, 3, C_FAINT);
+    int fill = constrain((barRsrp + 140) * bw / 96, 0, bw);
+    if (fill > 0) canvas.fillRect(bx, ry + 15, fill, 3, valueColor);
   }
 }
 
 void drawScreen() {
   CellRx c[MAX_CELLS];
-  OpRx o[MAX_OPERATORS];
+  NetRx nr[MAX_NETWORKS];
   StatusRx st;
   int rssi;
   unsigned long last, now = millis();
 
   portENTER_CRITICAL(&dataMux);
   for (auto &x : cells) if (x.used && now - x.seen > EXPIRE_MS) x.used = false;
-  for (auto &x : ops) if (x.used && now - x.seen > EXPIRE_MS) x.used = false;
+  for (auto &x : netTable) if (x.used && now - x.seen > EXPIRE_MS) x.used = false;
   if (beaconStatus.valid && now - beaconStatus.seen > EXPIRE_MS) beaconStatus.valid = false;
   memcpy(c, cells, sizeof(c));
-  memcpy(o, ops, sizeof(o));
+  memcpy(nr, netTable, sizeof(nr));
   st = beaconStatus;
   rssi = beaconRssi;
   last = lastPacket;
@@ -551,27 +580,20 @@ void drawScreen() {
   }
   std::sort(neigh, neigh + numNeigh, [](const CellRx &a, const CellRx &b) { return a.rsrp > b.rsrp; });
 
-  // Merge operator records (one per technology) into one row per network,
-  // the registered network first.
-  Network nets[MAX_OPERATORS];
+  // Networks: the one the SIM is registered on (matches the serving cell)
+  // first, then strongest 4G signal first.
+  Network nets[MAX_NETWORKS];
   int numNets = 0;
-  for (auto &x : o) {
+  for (auto &x : nr) {
     if (!x.used) continue;
-    int k = 0;
-    while (k < numNets && !(nets[k].mcc == x.mcc && nets[k].mnc == x.mnc)) k++;
-    if (k == numNets) {
-      nets[k] = {x.mcc, x.mnc, "", false, false, false, false};
-      strncpy(nets[k].name, x.name, sizeof(nets[k].name) - 1);
-      numNets++;
-    }
-    if (x.stat == 2) nets[k].current = true;
-    if (x.act == 7) nets[k].has4g = true;
-    else if (x.act >= 2) nets[k].has3g = true;
-    else nets[k].has2g = true;
+    nets[numNets].net = x;
+    nets[numNets].current = serving && serving->mcc == x.mcc && serving->mnc == x.mnc;
+    numNets++;
   }
   std::sort(nets, nets + numNets, [](const Network &a, const Network &b) {
     if (a.current != b.current) return a.current;
-    return a.has4g > b.has4g;
+    int ra = a.net.rsrp4g ? a.net.rsrp4g : -200, rb = b.net.rsrp4g ? b.net.rsrp4g : -200;
+    return ra > rb;
   });
 
   if (serving && !st.valid) cellAge = (now - serving->seen) / 1000;
@@ -580,7 +602,7 @@ void drawScreen() {
   drawHeader(now, last, rssi, st);
   drawServingCard(serving, nets, numNets, st, cellAge);
   drawNeighbourCard(neigh, numNeigh);
-  drawNetworksCard(nets, numNets, st.valid && (st.flags & STATUS_FLAG_OPS_SCAN));
+  drawNetworksCard(nets, numNets, st.valid && (st.flags & STATUS_FLAG_NET_SCAN));
   canvas.pushSprite(0, 0);
 }
 
