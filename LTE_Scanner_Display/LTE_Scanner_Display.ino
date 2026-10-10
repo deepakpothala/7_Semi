@@ -34,6 +34,12 @@
 #define MODEM_NOT_RESPONDING 4
 #define STATUS_FLAG_NET_SCAN 0x01  // AT+QOPS in progress
 
+#define DATA_UNKNOWN 0
+#define DATA_OK 1
+#define DATA_NO_CONTEXT 2
+#define DATA_NTP_FAILED 3
+#define DATA_STALE_S 300  // beacon checks every 2 min; older than this = not proven
+
 #define KIND_SERVING 0
 #define KIND_INTRA 1
 #define KIND_INTER 2
@@ -155,6 +161,9 @@ struct StatusRx {
   uint8_t state, flags, csq, recoveries, hardResets;
   uint16_t cellAge, netAge;  // seconds when sent, 0xFFFF = never
   uint32_t uptime;
+  uint8_t dataState;         // DATA_*
+  uint16_t dataAge;          // seconds since the last good internet check
+  uint16_t dataLatencyMs;    // NTP round trip of that check
   unsigned long seen;
 };
 
@@ -258,6 +267,10 @@ class BeaconCallbacks : public BLEAdvertisedDeviceCallbacks {
       s.uptime = d[15] | (d[16] << 8) | (d[17] << 16) | ((uint32_t)d[18] << 24);
       s.recoveries = d[19];
       s.hardResets = d[20];
+      // Internet check fields, absent from older beacon firmware.
+      s.dataState = n >= 26 ? d[21] : DATA_UNKNOWN;
+      s.dataAge = n >= 26 ? get16(d + 22) : 0xFFFF;
+      s.dataLatencyMs = n >= 26 ? get16(d + 24) : 0;
       s.seen = now;
       portENTER_CRITICAL(&dataMux);
       beaconStatus = s;
@@ -320,7 +333,7 @@ void drawHeader(unsigned long now, unsigned long last, int rssi, const StatusRx 
   canvas.setFont(&fonts::FreeSansBold9pt7b);
   canvas.setTextColor(C_TEXT);
   canvas.setTextDatum(textdatum_t::middle_left);
-  canvas.drawString("LTE Scanner", 8, 12);
+  int titleEnd = 8 + canvas.drawString("LTE Scanner", 8, 12);
 
   // Green: all good. Amber: beacon heard but its modem isn't registered.
   // Red: beacon not heard.
@@ -347,6 +360,32 @@ void drawHeader(unsigned long now, unsigned long last, int rssi, const StatusRx 
   canvas.setTextDatum(textdatum_t::middle_right);
   int w = canvas.drawString(status, 312, 12);
   canvas.fillSmoothCircle(312 - w - 8, 12, 3, color);
+
+  // Internet: proven by the beacon's last NTP check over mobile data.
+  if (!live || !st.valid || st.dataState == DATA_UNKNOWN) return;
+  char net[24];
+  uint16_t netColor;
+  long age = st.dataAge == 0xFFFF ? -1 : st.dataAge + (long)(now - st.seen) / 1000;
+  if (st.dataState == DATA_OK && age >= 0 && age <= DATA_STALE_S) {
+    snprintf(net, sizeof(net), "web %u ms", st.dataLatencyMs);
+    netColor = C_GREEN;
+  } else if (st.dataState == DATA_NO_CONTEXT) {
+    snprintf(net, sizeof(net), "no data");
+    netColor = C_AMBER;
+  } else {
+    snprintf(net, sizeof(net), "web down");
+    netColor = C_AMBER;
+  }
+  // Between the title and the right-hand status; drop the text, keeping the
+  // dot, if it would run into the status.
+  int dotX = titleEnd + 12;
+  int statusStart = 312 - w - 14;
+  canvas.fillSmoothCircle(dotX, 12, 3, netColor);
+  if (dotX + 8 + canvas.textWidth(net) < statusStart) {
+    canvas.setTextColor(netColor == C_GREEN ? C_DIM : netColor);
+    canvas.setTextDatum(textdatum_t::middle_left);
+    canvas.drawString(net, dotX + 8, 12);
+  }
 }
 
 void drawCardMessage(int x, int y, int w, int h, const char *title, const char *detail, uint16_t color) {

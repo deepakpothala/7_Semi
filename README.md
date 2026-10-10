@@ -36,6 +36,10 @@ The modem ships with no APN configured. On an O2 UK SIM a blank APN works:
 Verified with `AT+QNTP` (time from pool.ntp.org), `AT+QPING` to 8.8.8.8
 (~57 ms) and `AT+QHTTPGET` of http://httpbin.org/get (HTTP 200).
 
+`LTE_Scanner_Beacon` checks this by itself every 2 minutes: it activates the
+data context if needed (set `DATA_APN` for a non-O2 SIM) and fetches the time
+from pool.ntp.org. The display shows the result in its header ("web 368 ms").
+
 ### Power
 
 Connect **both** USB-C ports. One USB port alone powers only the ESP32; the
@@ -118,7 +122,7 @@ Network (type 4), one per operator from `AT+QOPS`, up to 26 bytes:
 
 The registered network is the one whose MCC/MNC matches the serving cell.
 
-Beacon status (type 3), 21 bytes total, sent once per rotation (even when
+Beacon status (type 3), 26 bytes total, sent once per rotation (even when
 there is no cell or network data, so the receiver knows the beacon is alive):
 
 | Bytes | Field                                                                 |
@@ -131,6 +135,9 @@ there is no cell or network data, so the receiver knows the beacon is alive):
 | 15-18 | Beacon uptime, seconds                                                |
 | 19    | Number of times the beacon has re-initialised the modem (soft)       |
 | 20    | Number of times the beacon has hard-reset the modem (GPIO 9)         |
+| 21    | Internet check: 0 not checked, 1 OK, 2 no IP (APN/activation failed), 3 NTP failed |
+| 22-23 | Seconds since the last good internet check (0xFFFF = never)          |
+| 24-25 | NTP round trip of the last good check, ms                            |
 
 ## Reference docs
 

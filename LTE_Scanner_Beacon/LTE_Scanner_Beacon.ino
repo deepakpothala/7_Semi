@@ -24,6 +24,13 @@
 #define MODEM_RESET_PIN 9  // HIGH pulse resets the EC200U (found with Reset_Probe)
 #define RESET_PULSE_MS 300
 
+// Internet check: make sure the data context has an IP, then fetch the time
+// from an NTP server. A blank APN works on O2 UK; set your operator's otherwise.
+#define DATA_APN ""
+#define NTP_SERVER "pool.ntp.org"
+#define DATA_CHECK_INTERVAL_MS (2UL * 60 * 1000)
+#define DATA_RETRY_MS (30UL * 1000)
+
 #define CELL_SCAN_INTERVAL_MS 5000
 #define NETWORK_SCAN_INTERVAL_MS (3UL * 60 * 1000)  // AT+QOPS takes ~40 s
 #define NETWORK_RETRY_MS (60UL * 1000)
@@ -46,6 +53,11 @@
 #define MODEM_NOT_RESPONDING 4
 
 #define STATUS_FLAG_NET_SCAN 0x01  // AT+QOPS in progress
+
+#define DATA_UNKNOWN 0     // not checked yet
+#define DATA_OK 1          // NTP reply received over mobile data
+#define DATA_NO_CONTEXT 2  // couldn't get an IP (APN / activation failed)
+#define DATA_NTP_FAILED 3  // had an IP but the NTP request failed
 
 #define NET_FLAG_MNC3 0x04
 #define NET_FLAG_4G 0x10
@@ -98,6 +110,9 @@ static volatile bool netScanRunning = false;
 static volatile unsigned long lastCellOk = 0, lastNetOk = 0;  // millis(), 0 = never
 static volatile uint8_t modemRecoveries = 0;  // soft re-initialisations
 static volatile uint8_t modemHardResets = 0;  // GPIO9 resets
+static volatile uint8_t dataState = DATA_UNKNOWN;
+static volatile unsigned long lastDataOk = 0;  // millis(), 0 = never
+static volatile uint16_t dataLatencyMs = 0;    // NTP round trip of the last good check
 static uint8_t statusSeq = 0;
 
 // Modem health, only touched by the modem task.
@@ -376,6 +391,65 @@ bool scanNetworks() {
   return n > 0;
 }
 
+// Reads modem output until a line starting with prefix arrives and returns
+// it, or "" on timeout. Used for results that come after the OK, as URCs.
+String waitForUrc(const char *prefix, unsigned long timeoutMs) {
+  String line = "";
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    while (Serial1.available()) {
+      char c = Serial1.read();
+      if (c != '\n') {
+        line += c;
+        continue;
+      }
+      line.trim();
+      if (line.startsWith(prefix)) return line;
+      if (line == "RDY") modemRebooted = true;
+      line = "";
+    }
+    esp_task_wdt_reset();
+    vTaskDelay(1);
+  }
+  return "";
+}
+
+// Proves the modem can reach the internet: activates the data context if it
+// has no IP (e.g. after a modem reset), then asks an NTP server for the time.
+bool checkData() {
+  String r = sendAT("AT+QIACT?");  // +QIACT: 1,1,1,"10.161.206.72" when active
+  if (r.indexOf("+QIACT: 1,1") < 0) {
+    Serial.println("Activating mobile data");
+    sendAT("AT+QICSGP=1,1,\"" DATA_APN "\",\"\",\"\",0");
+    r = sendAT("AT+QIACT=1", 150000);
+    if (r.indexOf("OK") < 0) {
+      dataState = DATA_NO_CONTEXT;
+      Serial.println("Data activation failed: " + r);
+      return false;
+    }
+  }
+
+  // +QNTP: <err>,"<time>" follows the OK; err 0 = success.
+  unsigned long t0 = millis();
+  r = sendAT("AT+QNTP=1,\"" NTP_SERVER "\",123", 5000);
+  String urc = "";
+  int p = r.indexOf("+QNTP:");
+  if (p >= 0) urc = r.substring(p);
+  else if (r.indexOf("OK") >= 0) urc = waitForUrc("+QNTP:", 30000);
+  unsigned long latency = millis() - t0;
+
+  if (urc.length() == 0 || urc.substring(6).toInt() != 0) {
+    dataState = DATA_NTP_FAILED;
+    Serial.println("NTP check failed: " + (urc.length() ? urc : r));
+    return false;
+  }
+  dataState = DATA_OK;
+  lastDataOk = millis();
+  dataLatencyMs = (uint16_t)min(latency, 65535UL);
+  Serial.printf("Internet OK: %s (%lu ms)\n", urc.c_str(), latency);
+  return true;
+}
+
 void clearCells() {
   xSemaphoreTake(dataLock, portMAX_DELAY);
   if (numCells) cellSeq++;
@@ -457,12 +531,15 @@ void modemTask(void *) {
   bool ready = false;
   bool haveNets = false;
   unsigned long lastNetAttempt = 0;
+  bool dataOk = false;
+  unsigned long lastDataCheck = 0;
 
   for (;;) {
     esp_task_wdt_reset();
 
     if (!ready) {
       clearCells();
+      lastDataCheck = 0;  // a reset modem loses its data context; re-check soon
       ready = modemInit();
       if (!ready) {
         Serial.println("Modem not responding, retrying in 5 s");
@@ -479,6 +556,11 @@ void modemTask(void *) {
         haveNets = scanNetworks();
         netScanRunning = false;
         lastNetAttempt = millis();
+      }
+      unsigned long dataWait = dataOk ? DATA_CHECK_INTERVAL_MS : DATA_RETRY_MS;
+      if (lastDataCheck == 0 || millis() - lastDataCheck > dataWait) {
+        dataOk = checkData();
+        lastDataCheck = millis();
       }
     } else {
       Serial.printf("Modem state %u, not scanning\n", modemState);
@@ -563,7 +645,10 @@ int buildStatusPacket(uint8_t *p) {
   for (int b = 0; b < 4; b++) p[i++] = (uptime >> (8 * b)) & 0xFF;
   p[i++] = modemRecoveries;
   p[i++] = modemHardResets;
-  return i;  // 21 bytes
+  p[i++] = dataState;
+  put16(p + i, ageSeconds(lastDataOk, now)); i += 2;
+  put16(p + i, dataLatencyMs); i += 2;
+  return i;  // 26 bytes, the most a legacy advert can carry
 }
 
 void advertise(const uint8_t *data, int len) {
