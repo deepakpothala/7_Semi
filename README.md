@@ -16,11 +16,20 @@ board.
 
 | EC200U Pin | ESP32 Pin    | Description            |
 |------------|--------------|-------------------------|
-| TX         | RX (GPIO 16) | Transmit from EC200U    |
-| RX         | TX (GPIO 17) | Receive from ESP32      |
+| TX         | RX (GPIO 12) | Transmit from EC200U    |
+| RX         | TX (GPIO 13) | Receive from ESP32      |
 | GND        | GND          | Ground                  |
 
-Source: 7Semi ESP32-S3 EC200U 4G User Manual v2.1/2.2.
+The user manual v2.1/2.2 lists GPIO 16/17, but on this board the modem only
+answers on GPIO 12/13 at 115200 baud (found with `AT_Command_Tester/Pin_Probe`).
+GPIO 1 also connects to the modem; driving it as an output restarted the
+modem during probing, so leave it alone.
+
+### Power
+
+Connect **both** USB-C ports. One USB port alone powers only the ESP32; the
+EC200U stays silent (no reply to AT, no Quectel USB ports on the PC) until
+its own port is connected too.
 
 ### Arduino IDE setup notes (from manufacturer manual)
 
@@ -32,6 +41,54 @@ Source: 7Semi ESP32-S3 EC200U 4G User Manual v2.1/2.2.
 - `AT_Command_Tester/` - UART passthrough between Serial Monitor and the
   EC200U modem, for sending AT commands and reading responses directly.
   First bring-up step for this board.
+- `GPS_Tracker/` - Enables the EC200U GNSS engine (`AT+QGPS=1`) and polls
+  `AT+QGPSLOC=2` every 5 s, printing lat/lon, altitude, speed and satellite
+  count. Requires the GNSS antenna and open sky.
+- `LTE_Scanner_Beacon/` - Runs on this board. Reads the serving and
+  neighbour LTE cells (`AT+QENG`) every 5 s and the visible operators
+  (`AT+COPS=?`) every 10 min, then broadcasts each record as a BLE
+  advertisement, rotating every 500 ms.
+- `LTE_Scanner_Display/` - Runs on a LilyGO T-Display-S3. Listens for the
+  beacon's adverts and shows operators plus cells sorted by RSRP with signal
+  bars. Needs the "GFX Library for Arduino" library. Board settings: ESP32S3
+  Dev Module, USB CDC On Boot Enabled, PSRAM OPI, Flash 16MB.
+
+Both LTE scanner sketches target Arduino-ESP32 core 3.x.
+
+## BLE advert format
+
+Manufacturer-specific data (AD type 0xFF), all multi-byte fields little-endian:
+
+| Bytes | Field                                                        |
+|-------|--------------------------------------------------------------|
+| 0-1   | Company ID `0xFFFF` (Bluetooth SIG test ID)                  |
+| 2-3   | Magic `'7' 'S'`                                              |
+| 4     | Type: 1 = LTE cell, 2 = operator                             |
+| 5     | Scan sequence number (increments each scan of that type)     |
+| 6-7   | Record index, record count                                   |
+| 8-9   | MCC                                                          |
+| 10-11 | MNC                                                          |
+| 12    | Flags: bits 0-1 cell kind (0 serving, 1 intra-freq neighbour, 2 inter-freq neighbour), bit 2 three-digit MNC, bit 3 TDD |
+
+Cell (type 1), 25 bytes total:
+
+| Bytes | Field                      |
+|-------|----------------------------|
+| 13    | LTE band                   |
+| 14-15 | EARFCN                     |
+| 16-17 | Physical cell ID (PCI)     |
+| 18    | RSRP, int8 dBm             |
+| 19    | RSRQ, int8 dB              |
+| 20    | SINR, int8 dB              |
+| 21-24 | Cell ID (serving cell only, else 0) |
+
+Operator (type 2):
+
+| Bytes | Field                                                       |
+|-------|-------------------------------------------------------------|
+| 13    | Status (3GPP 27.007): 1 available, 2 current, 3 forbidden   |
+| 14    | Access tech: 0 GSM, 2 UTRAN, 7 LTE                          |
+| 15-   | Operator short name, up to 11 ASCII chars, no terminator    |
 
 ## Reference docs
 

@@ -2,8 +2,8 @@
 // Type AT commands into the Serial Monitor; they are forwarded to the
 // EC200U modem over UART, and its responses are printed back.
 
-#define MODEM_RX_PIN 16  // ESP32 RX <- EC200U TX
-#define MODEM_TX_PIN 17  // ESP32 TX -> EC200U RX
+#define MODEM_RX_PIN 12  // ESP32 RX <- EC200U TX (manual says 16; measured 12)
+#define MODEM_TX_PIN 13  // ESP32 TX -> EC200U RX (manual says 17; measured 13)
 #define MODEM_BAUD 115200
 
 void setup() {
