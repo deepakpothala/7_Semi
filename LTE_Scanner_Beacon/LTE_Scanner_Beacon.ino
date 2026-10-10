@@ -1,14 +1,20 @@
 // 7Semi ESP32-S3 EC200U: LTE network scanner -> BLE beacon.
 // The EC200U reports the serving LTE cell and its neighbour cells
 // (AT+QENG) plus the operators it can see (AT+COPS=?). The ESP32-S3 packs
-// each result into a BLE advertisement and rotates through them.
+// each result into a BLE advertisement and rotates through them, together
+// with a status advert describing the modem's state.
 // LTE_Scanner_Display (LilyGO T-Display-S3) listens for these adverts.
+//
+// Reliability: waits for the modem (AT, SIM, registration) before scanning,
+// re-initialises it if it reboots ("RDY") or stops answering, and a task
+// watchdog restarts the ESP32 if the modem task or advert loop hangs.
 //
 // Built for Arduino-ESP32 core 3.x (its built-in BLE library).
 // Advert format: see README.md "BLE advert format".
 
 #include <BLEDevice.h>
 #include <BLEAdvertising.h>
+#include <esp_task_wdt.h>
 #include <functional>
 
 #define MODEM_RX_PIN 12  // ESP32 RX <- EC200U TX (manual says 16; measured 12)
@@ -19,12 +25,23 @@
 #define OPERATOR_SCAN_INTERVAL_MS (10UL * 60 * 1000)
 #define OPERATOR_RETRY_MS (60UL * 1000)
 #define ADV_DWELL_MS 500  // how long each record is advertised
+#define WDT_TIMEOUT_MS 30000
+#define MAX_AT_TIMEOUTS 3  // consecutive timeouts before re-initialising the modem
 
 #define COMPANY_ID 0xFFFF  // Bluetooth SIG ID reserved for testing
 #define MAGIC0 '7'
 #define MAGIC1 'S'
 #define TYPE_CELL 1
 #define TYPE_OPERATOR 2
+#define TYPE_STATUS 3
+
+#define MODEM_STARTING 0
+#define MODEM_NO_SIM 1
+#define MODEM_SEARCHING 2
+#define MODEM_REGISTERED 3
+#define MODEM_NOT_RESPONDING 4
+
+#define STATUS_FLAG_OPS_SCAN 0x01  // AT+COPS=? in progress
 
 #define KIND_SERVING 0
 #define KIND_INTRA 1  // neighbour on the same frequency
@@ -59,17 +76,33 @@ static uint8_t opSeq = 0;
 static SemaphoreHandle_t dataLock;
 static BLEAdvertising *adv;
 
+// Modem status, written by the modem task and read when building adverts.
+static volatile uint8_t modemState = MODEM_STARTING;
+static volatile uint8_t csq = 99;  // 99 = unknown
+static volatile bool opsScanRunning = false;
+static volatile unsigned long lastCellOk = 0, lastOpsOk = 0;  // millis(), 0 = never
+static volatile uint8_t modemRecoveries = 0;
+static uint8_t statusSeq = 0;
+
+// Modem health, only touched by the modem task.
+static int atTimeouts = 0;
+static bool modemRebooted = false;
+
 // ---------- Modem ----------
 
 // Discards input until the line has been quiet for idleMs, so a late reply to
 // an earlier command can't be mistaken for the next command's result.
+// Still watches for "RDY", which the modem prints after it reboots.
 void drainModem(unsigned long idleMs) {
+  uint32_t window = 0;
   unsigned long lastByte = millis();
   while (millis() - lastByte < idleMs) {
     if (Serial1.available()) {
-      Serial1.read();
+      window = (window << 8) | (uint8_t)Serial1.read();
+      if ((window & 0xFFFFFF) == (('R' << 16) | ('D' << 8) | 'Y')) modemRebooted = true;
       lastByte = millis();
     } else {
+      esp_task_wdt_reset();
       vTaskDelay(1);
     }
   }
@@ -89,12 +122,19 @@ String sendAT(const String &cmd, unsigned long timeoutMs = 2000) {
       resp += (char)Serial1.read();
     }
     done = resp.indexOf("OK\r\n") >= 0 || resp.indexOf("ERROR") >= 0;
-    if (!done) vTaskDelay(1);
+    if (!done) {
+      esp_task_wdt_reset();  // a long AT+COPS=? is slow, not hung
+      vTaskDelay(1);
+    }
   }
-  if (!done) {
+  if (done) {
+    atTimeouts = 0;
+  } else {
+    atTimeouts++;
     Serial.println("AT timeout: " + cmd);
     drainModem(1000);  // let the late reply arrive and throw it away
   }
+  if (resp.indexOf("RDY") >= 0) modemRebooted = true;
   resp.trim();
   return resp;
 }
@@ -224,6 +264,7 @@ void scanCells() {
   numCells = n;
   cellSeq++;
   xSemaphoreGive(dataLock);
+  if (n > 0) lastCellOk = millis();
 
   for (int k = 0; k < n; k++) {
     const Cell &c = found[k];
@@ -271,6 +312,7 @@ bool scanOperators() {
   numOps = n;
   opSeq++;
   xSemaphoreGive(dataLock);
+  if (n > 0) lastOpsOk = millis();
 
   for (int k = 0; k < n; k++) {
     Serial.printf("OP %-11s %u-%0*u stat %u act %u\n", found[k].name, found[k].mcc,
@@ -279,15 +321,97 @@ bool scanOperators() {
   return n > 0;
 }
 
+void clearCells() {
+  xSemaphoreTake(dataLock, portMAX_DELAY);
+  if (numCells) cellSeq++;
+  numCells = 0;
+  xSemaphoreGive(dataLock);
+}
+
+// Waits for the modem to answer AT (it takes ~10 s after power-up), then
+// applies the settings a modem reboot would have reset.
+bool modemInit() {
+  modemState = MODEM_STARTING;
+  Serial.println("Waiting for modem...");
+  bool alive = false;
+  for (int i = 0; i < 20 && !alive; i++) {
+    alive = sendAT("AT", 1000).indexOf("OK") >= 0;
+  }
+  if (!alive) {
+    modemState = MODEM_NOT_RESPONDING;
+    return false;
+  }
+  sendAT("ATE0");
+  sendAT("AT+CMEE=1");  // numeric error codes
+  modemRebooted = false;
+  atTimeouts = 0;
+  Serial.println("Modem ready");
+  return true;
+}
+
+// Checks SIM, signal and registration. Returns true when registered on LTE.
+bool updateStatus() {
+  String r = sendAT("AT+CPIN?");
+  if (r.indexOf("READY") < 0) {
+    modemState = atTimeouts ? MODEM_NOT_RESPONDING : MODEM_NO_SIM;
+    return false;
+  }
+
+  r = sendAT("AT+CSQ");  // +CSQ: <rssi>,<ber>
+  int p = r.indexOf("+CSQ:");
+  if (p >= 0) csq = r.substring(p + 5).toInt();
+
+  r = sendAT("AT+CEREG?");  // +CEREG: <n>,<stat>; stat 1 = home, 5 = roaming
+  int stat = -1;
+  p = r.indexOf("+CEREG:");
+  if (p >= 0) {
+    int comma = r.indexOf(',', p);
+    if (comma > 0) stat = r.substring(comma + 1).toInt();
+  }
+  bool registered = stat == 1 || stat == 5;
+  modemState = registered ? MODEM_REGISTERED : MODEM_SEARCHING;
+  return registered;
+}
+
 void modemTask(void *) {
-  unsigned long lastOpsAttempt = 0;
+  esp_task_wdt_add(NULL);
+  bool ready = false;
   bool haveOps = false;
+  unsigned long lastOpsAttempt = 0;
+
   for (;;) {
-    scanCells();
-    unsigned long wait = haveOps ? OPERATOR_SCAN_INTERVAL_MS : OPERATOR_RETRY_MS;
-    if (lastOpsAttempt == 0 || millis() - lastOpsAttempt > wait) {
-      haveOps = scanOperators();
-      lastOpsAttempt = millis();
+    esp_task_wdt_reset();
+
+    if (!ready) {
+      clearCells();
+      ready = modemInit();
+      if (!ready) {
+        Serial.println("Modem not responding, retrying in 5 s");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        continue;
+      }
+    }
+
+    if (updateStatus()) {
+      scanCells();
+      unsigned long wait = haveOps ? OPERATOR_SCAN_INTERVAL_MS : OPERATOR_RETRY_MS;
+      if (lastOpsAttempt == 0 || millis() - lastOpsAttempt > wait) {
+        opsScanRunning = true;
+        haveOps = scanOperators();
+        opsScanRunning = false;
+        lastOpsAttempt = millis();
+      }
+    } else {
+      Serial.printf("Modem state %u, not scanning\n", modemState);
+      clearCells();
+    }
+
+    if (modemRebooted || atTimeouts >= MAX_AT_TIMEOUTS) {
+      Serial.println(modemRebooted ? "Modem rebooted, re-initialising"
+                                   : "Modem stopped answering, re-initialising");
+      ready = false;
+      modemRecoveries++;
+      continue;
     }
     vTaskDelay(pdMS_TO_TICKS(CELL_SCAN_INTERVAL_MS));
   }
@@ -341,6 +465,25 @@ int buildOperatorPacket(uint8_t *p, int idx) {
   return i + len;  // up to 24 bytes
 }
 
+uint16_t ageSeconds(unsigned long t, unsigned long now) {
+  if (t == 0) return 0xFFFF;  // never
+  return (uint16_t)min((now - t) / 1000, 0xFFFEUL);
+}
+
+int buildStatusPacket(uint8_t *p) {
+  unsigned long now = millis();
+  int i = writeHeader(p, TYPE_STATUS, statusSeq++, 0, 1);
+  p[i++] = modemState;
+  p[i++] = opsScanRunning ? STATUS_FLAG_OPS_SCAN : 0;
+  p[i++] = csq;
+  put16(p + i, ageSeconds(lastCellOk, now)); i += 2;
+  put16(p + i, ageSeconds(lastOpsOk, now)); i += 2;
+  uint32_t uptime = now / 1000;
+  for (int b = 0; b < 4; b++) p[i++] = (uptime >> (8 * b)) & 0xFF;
+  p[i++] = modemRecoveries;
+  return i;  // 20 bytes
+}
+
 void advertise(const uint8_t *data, int len) {
   BLEAdvertisementData ad;
   ad.setFlags(0x06);  // LE general discoverable, BR/EDR not supported
@@ -369,28 +512,36 @@ void setup() {
   adv->setMaxInterval(0xB0);
   adv->setScanResponse(false);
 
-  sendAT("ATE0");
-  sendAT("AT+CMEE=1");  // numeric error codes
+  // Restart the ESP32 if the modem task or this loop stops checking in.
+  esp_task_wdt_config_t wdt = {
+    .timeout_ms = WDT_TIMEOUT_MS,
+    .idle_core_mask = 0,
+    .trigger_panic = true,
+  };
+  if (esp_task_wdt_reconfigure(&wdt) != ESP_OK) esp_task_wdt_init(&wdt);
+  esp_task_wdt_add(NULL);  // setup() and loop() run in the same task
 
+  // All modem I/O happens in its own task, including start-up.
   xTaskCreatePinnedToCore(modemTask, "modem", 12288, nullptr, 1, nullptr, 1);
 }
 
 void loop() {
   static int slot = 0;
   uint8_t pkt[25];
-  int len = 0;
+  int len;
 
+  // Rotation: status first, then cells, then operators. Status is always
+  // sent, so the display knows the beacon is alive even with no data.
   xSemaphoreTake(dataLock, portMAX_DELAY);
-  int total = numCells + numOps;
-  if (total > 0) {
-    slot %= total;
-    len = slot < numCells ? buildCellPacket(pkt, slot) : buildOperatorPacket(pkt, slot - numCells);
-  }
+  int total = 1 + numCells + numOps;
+  slot %= total;
+  if (slot == 0) len = buildStatusPacket(pkt);
+  else if (slot <= numCells) len = buildCellPacket(pkt, slot - 1);
+  else len = buildOperatorPacket(pkt, slot - 1 - numCells);
   xSemaphoreGive(dataLock);
 
-  if (len > 0) {
-    advertise(pkt, len);
-    slot++;
-  }
+  advertise(pkt, len);
+  slot++;
+  esp_task_wdt_reset();
   delay(ADV_DWELL_MS);
 }

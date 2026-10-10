@@ -2,6 +2,8 @@
 // Passively scans BLE for the 7Semi beacon's adverts, collects the operator
 // and LTE cell records, and draws a dashboard on the 320x170 display:
 // serving cell with signal bars, neighbour cells, and visible networks.
+// The beacon's status advert tells it the modem state and how old the cell
+// data is, so stale or missing data is shown as such rather than as live.
 //
 // Built for Arduino-ESP32 core 3.x. Needs the LovyanGFX library.
 // Board: ESP32S3 Dev Module, USB CDC On Boot: Enabled, PSRAM: OPI PSRAM.
@@ -11,6 +13,7 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <esp_task_wdt.h>
 
 #define PIN_LCD_POWER 15
 
@@ -18,6 +21,15 @@
 #define MAGIC1 'S'
 #define TYPE_CELL 1
 #define TYPE_OPERATOR 2
+#define TYPE_STATUS 3
+
+#define MODEM_STARTING 0
+#define MODEM_NO_SIM 1
+#define MODEM_SEARCHING 2
+#define MODEM_REGISTERED 3
+#define MODEM_NOT_RESPONDING 4
+#define STATUS_FLAG_OPS_SCAN 0x01
+
 #define KIND_SERVING 0
 #define KIND_INTRA 1
 #define KIND_INTER 2
@@ -26,7 +38,9 @@
 #define MAX_OPERATORS 8
 #define EXPIRE_MS 30000  // drop records the beacon stopped sending
 #define STALE_MS 5000    // beacon counts as lost after this long without adverts
+#define CELL_STALE_S 15  // serving cell readout dims when older than this
 #define REDRAW_MS 500
+#define WDT_TIMEOUT_MS 15000
 
 // T-Display-S3: ST7789 170x320 on an 8-bit parallel bus.
 class LGFX_TDisplayS3 : public lgfx::LGFX_Device {
@@ -129,8 +143,17 @@ struct Quality {
   uint16_t color;
 };
 
+struct StatusRx {
+  bool valid;
+  uint8_t state, flags, csq, recoveries;
+  uint16_t cellAge, opsAge;  // seconds when sent, 0xFFFF = never
+  uint32_t uptime;
+  unsigned long seen;
+};
+
 static CellRx cells[MAX_CELLS];
 static OpRx ops[MAX_OPERATORS];
+static StatusRx beaconStatus;
 static int beaconRssi = 0;
 static unsigned long lastPacket = 0;
 static portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
@@ -215,6 +238,22 @@ class BeaconCallbacks : public BLEAdvertisedDeviceCallbacks {
       beaconRssi = dev.getRSSI();
       lastPacket = now;
       portEXIT_CRITICAL(&dataMux);
+    } else if (type == TYPE_STATUS && n >= 20) {
+      StatusRx s;
+      s.valid = true;
+      s.state = d[8];
+      s.flags = d[9];
+      s.csq = d[10];
+      s.cellAge = get16(d + 11);
+      s.opsAge = get16(d + 13);
+      s.uptime = d[15] | (d[16] << 8) | (d[17] << 16) | ((uint32_t)d[18] << 24);
+      s.recoveries = d[19];
+      s.seen = now;
+      portENTER_CRITICAL(&dataMux);
+      beaconStatus = s;
+      beaconRssi = dev.getRSSI();
+      lastPacket = now;
+      portEXIT_CRITICAL(&dataMux);
     }
   }
 };
@@ -258,38 +297,94 @@ void drawPill(int x, int y, int w, int h, uint16_t bg, uint16_t fg, const char *
   canvas.drawString(text, x + w / 2, y + h / 2 + 1);
 }
 
-void drawHeader(unsigned long now, unsigned long last, int rssi) {
+// Same hue at half brightness, for stale readings.
+uint16_t dim(uint16_t c) {
+  return (c >> 1) & 0x7BEF;
+}
+
+bool modemProblem(const StatusRx &st) {
+  return st.valid && st.state != MODEM_REGISTERED;
+}
+
+void drawHeader(unsigned long now, unsigned long last, int rssi, const StatusRx &st) {
   canvas.setFont(&fonts::FreeSansBold9pt7b);
   canvas.setTextColor(C_TEXT);
   canvas.setTextDatum(textdatum_t::middle_left);
   canvas.drawString("LTE Scanner", 8, 12);
 
+  // Green: all good. Amber: beacon heard but its modem isn't registered.
+  // Red: beacon not heard.
   char status[32];
+  uint16_t color;
   bool live = last && now - last < STALE_MS;
-  if (last == 0) snprintf(status, sizeof(status), "searching...");
-  else if (live) snprintf(status, sizeof(status), "BLE %d dBm", rssi);
-  else snprintf(status, sizeof(status), "lost %lus ago", (now - last) / 1000);
+  if (last == 0) {
+    snprintf(status, sizeof(status), "searching...");
+    color = C_RED;
+  } else if (!live) {
+    snprintf(status, sizeof(status), "beacon lost %lus", (now - last) / 1000);
+    color = C_RED;
+  } else if (modemProblem(st)) {
+    static const char *names[] = {"modem starting", "no SIM", "no network", "", "modem silent"};
+    snprintf(status, sizeof(status), "%s", st.state < 5 ? names[st.state] : "modem ?");
+    color = C_AMBER;
+  } else {
+    snprintf(status, sizeof(status), "BLE %d dBm", rssi);
+    color = C_GREEN;
+  }
 
   canvas.setFont(&fonts::DejaVu9);
-  canvas.setTextColor(live ? C_DIM : C_RED);
+  canvas.setTextColor(color == C_GREEN ? C_DIM : color);
   canvas.setTextDatum(textdatum_t::middle_right);
   int w = canvas.drawString(status, 312, 12);
-  canvas.fillSmoothCircle(312 - w - 8, 12, 3, live ? C_GREEN : C_RED);
+  canvas.fillSmoothCircle(312 - w - 8, 12, 3, color);
 }
 
-void drawServingCard(const CellRx *serving, const Network *nets, int numNets) {
+void drawCardMessage(int x, int y, int w, int h, const char *title, const char *detail, uint16_t color) {
+  canvas.setFont(&fonts::DejaVu12);
+  canvas.setTextColor(color);
+  canvas.setTextDatum(textdatum_t::middle_center);
+  canvas.drawString(title, x + w / 2, y + h / 2 - 8);
+  canvas.setFont(&fonts::DejaVu9);
+  canvas.setTextColor(C_DIM);
+  canvas.drawString(detail, x + w / 2, y + h / 2 + 10);
+}
+
+// cellAge: seconds since the beacon last read the serving cell, -1 = unknown.
+void drawServingCard(const CellRx *serving, const Network *nets, int numNets,
+                     const StatusRx &st, long cellAge) {
   const int x = 6, y = 26, w = 198, h = 92;
   canvas.fillSmoothRoundRect(x, y, w, h, 8, C_CARD);
 
-  if (!serving) {
-    canvas.setFont(&fonts::DejaVu12);
-    canvas.setTextColor(C_DIM);
-    canvas.setTextDatum(textdatum_t::middle_center);
-    canvas.drawString(lastPacket ? "No serving cell" : "Waiting for beacon", x + w / 2, y + h / 2);
+  if (modemProblem(st) && !serving) {
+    char detail[32];
+    switch (st.state) {
+      case MODEM_STARTING:
+        drawCardMessage(x, y, w, h, "Modem starting", "waiting for it to answer", C_AMBER);
+        break;
+      case MODEM_NO_SIM:
+        drawCardMessage(x, y, w, h, "SIM not ready", "check the SIM card", C_AMBER);
+        break;
+      case MODEM_SEARCHING:
+        snprintf(detail, sizeof(detail), "signal CSQ %u", st.csq);
+        drawCardMessage(x, y, w, h, "Searching for network", st.csq == 99 ? "no signal" : detail, C_AMBER);
+        break;
+      default:
+        snprintf(detail, sizeof(detail), "check power - restarts: %u", st.recoveries);
+        drawCardMessage(x, y, w, h, "Modem not responding", detail, C_RED);
+        break;
+    }
     return;
   }
 
+  if (!serving) {
+    drawCardMessage(x, y, w, h, lastPacket ? "No serving cell" : "Waiting for beacon",
+                    lastPacket ? "modem has no LTE cell yet" : "is the transmitter on?", C_DIM);
+    return;
+  }
+
+  bool stale = cellAge > CELL_STALE_S;
   Quality q = rsrpQuality(serving->rsrp);
+  if (stale) q.color = dim(q.color);
 
   // Operator name from the networks list, else MCC-MNC.
   char opName[20];
@@ -316,7 +411,7 @@ void drawServingCard(const CellRx *serving, const Network *nets, int numNets) {
   char rsrp[8];
   snprintf(rsrp, sizeof(rsrp), "%d", serving->rsrp);
   canvas.setFont(&fonts::FreeSansBold24pt7b);
-  canvas.setTextColor(C_TEXT);
+  canvas.setTextColor(stale ? C_DIM : C_TEXT);
   canvas.setTextDatum(textdatum_t::baseline_left);
   int nw = canvas.drawString(rsrp, x + 8, y + 64);
   canvas.setFont(&fonts::DejaVu12);
@@ -325,10 +420,15 @@ void drawServingCard(const CellRx *serving, const Network *nets, int numNets) {
 
   drawSignalBars(x + w - 62, y + 64, q.bars, q.color);
 
+  // Bottom line: cell details while fresh, a warning once the reading is old.
   char detail[48];
-  snprintf(detail, sizeof(detail), "Band %u   PCI %u   RSRQ %d dB", serving->band, serving->pci, serving->rsrq);
+  if (stale) {
+    snprintf(detail, sizeof(detail), "no update for %lds", cellAge);
+  } else {
+    snprintf(detail, sizeof(detail), "Band %u   PCI %u   RSRQ %d dB", serving->band, serving->pci, serving->rsrq);
+  }
   canvas.setFont(&fonts::DejaVu9);
-  canvas.setTextColor(C_DIM);
+  canvas.setTextColor(stale ? C_AMBER : C_DIM);
   canvas.setTextDatum(textdatum_t::top_left);
   canvas.drawString(detail, x + 10, y + 74);
 }
@@ -362,13 +462,16 @@ void drawNeighbourCard(const CellRx *list, int count) {
   }
 }
 
-void drawNetworksCard(const Network *nets, int count) {
+void drawNetworksCard(const Network *nets, int count, bool scanning) {
   const int x = 210, y = 26, w = 104, h = 138;
   canvas.fillSmoothRoundRect(x, y, w, h, 8, C_CARD);
   canvas.setFont(&fonts::DejaVu9);
   canvas.setTextColor(C_DIM);
   canvas.setTextDatum(textdatum_t::top_left);
   canvas.drawString("NETWORKS", x + 9, y + 5);
+  if (scanning && count > 0) {
+    canvas.fillSmoothCircle(x + w - 10, y + 9, 3, C_AMBER);  // a fresh scan is running
+  }
 
   if (count == 0) {
     canvas.setTextColor(C_FAINT);
@@ -413,17 +516,26 @@ void drawNetworksCard(const Network *nets, int count) {
 void drawScreen() {
   CellRx c[MAX_CELLS];
   OpRx o[MAX_OPERATORS];
+  StatusRx st;
   int rssi;
   unsigned long last, now = millis();
 
   portENTER_CRITICAL(&dataMux);
   for (auto &x : cells) if (x.used && now - x.seen > EXPIRE_MS) x.used = false;
   for (auto &x : ops) if (x.used && now - x.seen > EXPIRE_MS) x.used = false;
+  if (beaconStatus.valid && now - beaconStatus.seen > EXPIRE_MS) beaconStatus.valid = false;
   memcpy(c, cells, sizeof(c));
   memcpy(o, ops, sizeof(o));
+  st = beaconStatus;
   rssi = beaconRssi;
   last = lastPacket;
   portEXIT_CRITICAL(&dataMux);
+
+  // Age of the serving-cell reading: as reported by the beacon, plus the time
+  // since that status advert arrived. Without status, fall back to how long
+  // ago the cell advert itself was heard.
+  long cellAge = -1;
+  if (st.valid && st.cellAge != 0xFFFF) cellAge = st.cellAge + (now - st.seen) / 1000;
 
   // Serving cell, and neighbours sorted strongest first.
   const CellRx *serving = nullptr;
@@ -462,11 +574,13 @@ void drawScreen() {
     return a.has4g > b.has4g;
   });
 
+  if (serving && !st.valid) cellAge = (now - serving->seen) / 1000;
+
   canvas.fillScreen(C_BG);
-  drawHeader(now, last, rssi);
-  drawServingCard(serving, nets, numNets);
+  drawHeader(now, last, rssi, st);
+  drawServingCard(serving, nets, numNets, st, cellAge);
   drawNeighbourCard(neigh, numNeigh);
-  drawNetworksCard(nets, numNets);
+  drawNetworksCard(nets, numNets, st.valid && (st.flags & STATUS_FLAG_OPS_SCAN));
   canvas.pushSprite(0, 0);
 }
 
@@ -491,6 +605,15 @@ void setup() {
   scan->setWindow(100);  // window == interval: listen continuously
   scan->start(0, nullptr, false);  // 0 = scan forever, in the background
   Serial.println("Scanning for 7Semi LTE beacon...");
+
+  // Restart if the draw loop ever stops running.
+  esp_task_wdt_config_t wdt = {
+    .timeout_ms = WDT_TIMEOUT_MS,
+    .idle_core_mask = 0,
+    .trigger_panic = true,
+  };
+  if (esp_task_wdt_reconfigure(&wdt) != ESP_OK) esp_task_wdt_init(&wdt);
+  esp_task_wdt_add(NULL);
 }
 
 void loop() {
@@ -498,5 +621,6 @@ void loop() {
   if (millis() - lastDraw >= REDRAW_MS) {
     lastDraw = millis();
     drawScreen();
+    esp_task_wdt_reset();
   }
 }

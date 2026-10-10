@@ -64,9 +64,14 @@ Manufacturer-specific data (AD type 0xFF), all multi-byte fields little-endian:
 |-------|--------------------------------------------------------------|
 | 0-1   | Company ID `0xFFFF` (Bluetooth SIG test ID)                  |
 | 2-3   | Magic `'7' 'S'`                                              |
-| 4     | Type: 1 = LTE cell, 2 = operator                             |
+| 4     | Type: 1 = LTE cell, 2 = operator, 3 = beacon status          |
 | 5     | Scan sequence number (increments each scan of that type)     |
 | 6-7   | Record index, record count                                   |
+
+Cells and operators continue with:
+
+| Bytes | Field                                                        |
+|-------|--------------------------------------------------------------|
 | 8-9   | MCC                                                          |
 | 10-11 | MNC                                                          |
 | 12    | Flags: bits 0-1 cell kind (0 serving, 1 intra-freq neighbour, 2 inter-freq neighbour), bit 2 three-digit MNC, bit 3 TDD |
@@ -90,6 +95,19 @@ Operator (type 2):
 | 13    | Status (3GPP 27.007): 1 available, 2 current, 3 forbidden   |
 | 14    | Access tech: 0 GSM, 2 UTRAN, 7 LTE                          |
 | 15-   | Operator short name, up to 11 ASCII chars, no terminator    |
+
+Beacon status (type 3), 20 bytes total, sent once per rotation (even when
+there is no cell or operator data, so the receiver knows the beacon is alive):
+
+| Bytes | Field                                                                 |
+|-------|-----------------------------------------------------------------------|
+| 8     | Modem state: 0 starting, 1 SIM not ready, 2 searching, 3 registered, 4 not responding |
+| 9     | Flags: bit 0 operator scan (`AT+COPS=?`) in progress                  |
+| 10    | CSQ signal (0-31, 99 = unknown)                                       |
+| 11-12 | Seconds since the last good serving-cell reading (0xFFFF = never)     |
+| 13-14 | Seconds since the last good operator scan (0xFFFF = never)            |
+| 15-18 | Beacon uptime, seconds                                                |
+| 19    | Number of times the beacon has re-initialised the modem              |
 
 ## Reference docs
 
