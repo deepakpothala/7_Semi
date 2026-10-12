@@ -55,11 +55,12 @@
 #define MAGIC0 '7'
 #define MAGIC1 'S'
 // v1 was one 31-byte legacy advert per record; v2 the snapshot; v3 adds the
-// mobile data byte counters and the last NTP time to the status block.
-#define PROTOCOL_VERSION 3
+// mobile data byte counters and the last NTP time to the status block; v4
+// adds the GNSS fix state, satellite counts and position.
+#define PROTOCOL_VERSION 4
 #define SNAP_MAX_CELLS 8
 #define SNAP_MAX_NETS 6
-#define SNAP_MAX_BYTES 240  // 36 header+status, 1+9+8*9 cells, 1+6*19 networks = 233
+#define SNAP_MAX_BYTES 256  // 50 header+status, 1+9+8*9 cells, 1+6*19 networks = 247
 
 #define MODEM_STARTING 0
 #define MODEM_NO_SIM 1
@@ -73,6 +74,11 @@
 #define DATA_OK 1          // NTP reply received over mobile data
 #define DATA_NO_CONTEXT 2  // couldn't get an IP (APN / activation failed)
 #define DATA_NTP_FAILED 3  // had an IP but the NTP request failed
+
+#define GNSS_OFF 0        // engine not started / modem not answering
+#define GNSS_SEARCHING 1  // running, no fix yet
+#define GNSS_FIX_2D 2
+#define GNSS_FIX_3D 3
 
 #define NET_FLAG_MNC3 0x04
 #define NET_FLAG_4G 0x10
@@ -127,6 +133,12 @@ static volatile unsigned long lastDataOk = 0;  // millis(), 0 = never
 static volatile uint16_t dataLatencyMs = 0;    // NTP round trip of the last good check
 static volatile uint32_t dataBytesSent = 0;      // modem's mobile data counter (AT+QGDCNT)
 static volatile uint32_t dataBytesReceived = 0;
+// GNSS, written by the modem task, read when a snapshot is built.
+static volatile uint8_t gnssState = GNSS_OFF;
+static volatile uint8_t gnssSatsUsed = 0, gnssSatsView = 0, gnssHdop10 = 0;
+static volatile int32_t gnssLat = 0, gnssLon = 0;  // degrees * 1e6
+static volatile unsigned long lastGnssPoll = 0;    // millis(), 0 = never
+
 static volatile uint32_t ntpEpoch = 0;  // UTC time from the last good NTP check, 0 = none
 
 // Modem health, only touched by the modem task.
@@ -481,6 +493,62 @@ bool checkData() {
   return true;
 }
 
+// Reads the GNSS state: position and satellites used from AT+QGPSLOC, and the
+// number of satellites in view from the NMEA GSV sentences.
+void pollGnss() {
+  String r = sendAT("AT+QGPSLOC=2", 3000);
+  int p = r.indexOf("+QGPSLOC: ");
+  if (p >= 0) {
+    // +QGPSLOC: <UTC>,<lat>,<lon>,<HDOP>,<alt>,<fix>,<COG>,<spkm>,<spkn>,<date>,<nsat>
+    String line = r.substring(p + 10);
+    int eol = line.indexOf('\r');
+    if (eol >= 0) line = line.substring(0, eol);
+    String f[11];
+    int n = 0, start = 0;
+    while (n < 11) {
+      int c = line.indexOf(',', start);
+      f[n++] = line.substring(start, c < 0 ? line.length() : c);
+      if (c < 0) break;
+      start = c + 1;
+    }
+    if (n == 11) {
+      gnssLat = (int32_t)lround(f[1].toDouble() * 1e6);
+      gnssLon = (int32_t)lround(f[2].toDouble() * 1e6);
+      gnssHdop10 = (uint8_t)constrain((int)lround(f[3].toDouble() * 10), 0, 255);
+      gnssSatsUsed = (uint8_t)constrain(f[10].toInt(), 0, 255);
+      gnssState = f[5].toInt() >= 3 ? GNSS_FIX_3D : GNSS_FIX_2D;
+      lastGnssPoll = millis();
+    }
+  } else if (r.indexOf("516") >= 0) {  // no fix yet
+    gnssState = GNSS_SEARCHING;
+    gnssSatsUsed = 0;
+    gnssHdop10 = 0;
+    gnssLat = gnssLon = 0;
+    lastGnssPoll = millis();
+  } else if (r.indexOf("505") >= 0) {  // session not active (modem restarted)
+    sendAT("AT+QGPS=1");
+    gnssState = GNSS_SEARCHING;
+  } else {
+    return;  // no usable answer; keep the old values, the age will show it
+  }
+
+  // +QGPSGNMEA: $GPGSV,<messages>,<this message>,<satellites in view>,...
+  // Every constellation sends its own GSV; the first message of each carries
+  // that constellation's in-view count.
+  r = sendAT("AT+QGPSGNMEA=\"GSV\"", 3000);
+  int total = 0, pos = 0;
+  while ((pos = r.indexOf("GSV,", pos)) >= 0) {
+    int msgs = r.substring(pos + 4).toInt();
+    int c1 = r.indexOf(',', pos + 4);
+    int c2 = c1 < 0 ? -1 : r.indexOf(',', c1 + 1);
+    if (msgs > 0 && c1 > 0 && c2 > 0 && r.substring(c1 + 1).toInt() == 1) {
+      total += r.substring(c2 + 1).toInt();
+    }
+    pos += 4;
+  }
+  gnssSatsView = (uint8_t)min(total, 255);
+}
+
 void clearCells() {
   xSemaphoreTake(dataLock, portMAX_DELAY);
   numCells = 0;
@@ -526,6 +594,8 @@ bool modemInit() {
   }
   sendAT("ATE0");
   sendAT("AT+CMEE=1");  // numeric error codes
+  sendAT("AT+QGPS=1");  // start GNSS; error 504 = already running, which is fine
+  gnssState = GNSS_SEARCHING;
   modemRebooted = false;
   atTimeouts = 0;
   Serial.println("Modem ready");
@@ -609,6 +679,8 @@ void modemTask(void *) {
       clearCells();
     }
 
+    pollGnss();
+
     if (modemRebooted || atTimeouts >= MAX_AT_TIMEOUTS) {
       Serial.println(modemRebooted ? "Modem rebooted, re-initialising"
                                    : "Modem stopped answering, re-initialising");
@@ -649,7 +721,7 @@ int buildSnapshot(uint8_t *p) {
   p[i++] = PROTOCOL_VERSION;
   p[i++] = snapshotSeq++;
 
-  // Status (18 bytes).
+  // Status (44 bytes).
   p[i++] = modemState;
   p[i++] = netScanRunning ? STATUS_FLAG_NET_SCAN : 0;
   p[i++] = csq;
@@ -665,6 +737,13 @@ int buildSnapshot(uint8_t *p) {
   put32(p + i, dataBytesSent); i += 4;
   put32(p + i, dataBytesReceived); i += 4;
   put32(p + i, ntpEpoch); i += 4;
+  p[i++] = gnssState;
+  p[i++] = gnssSatsUsed;
+  p[i++] = gnssSatsView;
+  p[i++] = gnssHdop10;
+  put16(p + i, ageSeconds(lastGnssPoll, now)); i += 2;
+  put32(p + i, (uint32_t)gnssLat); i += 4;
+  put32(p + i, (uint32_t)gnssLon); i += 4;
 
   xSemaphoreTake(dataLock, portMAX_DELAY);
 

@@ -82,25 +82,25 @@ boards are ESP32-S3, which supports BLE 5; the original ESP32 does not.
 
 ## BLE advert format
 
-Protocol version 3. The beacon sends one non-connectable BLE 5 extended
+Protocol version 4. The beacon sends one non-connectable BLE 5 extended
 advertisement (1M PHY, every 100 ms, +20 dBm) whose manufacturer-specific
 data (AD type 0xFF) is a complete snapshot, rebuilt every second. The
 receiver replaces everything it shows with each snapshot, so a cell the
 modem stops reporting disappears with the next one. A snapshot is at most
-233 bytes, so it fits one advertising PDU without chaining. All multi-byte
+247 bytes, so it fits one advertising PDU without chaining. All multi-byte
 fields are little-endian.
 
 (Version 1 sent one 31-byte legacy advert per record in rotation; the
 status record alone had filled the 26 usable bytes. Version 2 introduced
-the snapshot; version 3 added the data byte counters and NTP time.)
+the snapshot; version 3 added the data byte counters and NTP time; version 4 added GNSS.)
 
-Header and status, 36 bytes:
+Header and status, 50 bytes:
 
 | Bytes | Field                                                                 |
 |-------|-----------------------------------------------------------------------|
 | 0-1   | Company ID `0xFFFF` (Bluetooth SIG test ID)                           |
 | 2-3   | Magic `'7' 'S'`                                                       |
-| 4     | Protocol version (3)                                                  |
+| 4     | Protocol version (4)                                                  |
 | 5     | Snapshot sequence number                                              |
 | 6     | Modem state: 0 starting, 1 SIM not ready, 2 searching, 3 registered, 4 not responding |
 | 7     | Flags: bit 0 network scan (`AT+QOPS`) in progress                     |
@@ -116,6 +116,13 @@ Header and status, 36 bytes:
 | 24-27 | Mobile data bytes sent (modem counter, `AT+QGDCNT?`)                  |
 | 28-31 | Mobile data bytes received                                            |
 | 32-35 | UTC time from the last good NTP check, seconds since 1970 (0 = none)  |
+| 36    | GNSS state: 0 off, 1 searching (no fix), 2 fix 2D, 3 fix 3D          |
+| 37    | Satellites used in the fix (`AT+QGPSLOC`)                             |
+| 38    | Satellites in view, summed over all constellations (NMEA GSV)         |
+| 39    | HDOP * 10                                                             |
+| 40-41 | Seconds since the last GNSS poll (0xFFFF = never)                     |
+| 42-45 | Latitude, int32, degrees * 1e6 (0 without a fix)                      |
+| 46-49 | Longitude, int32, degrees * 1e6 (0 without a fix)                     |
 
 Cells: a count byte (0-8), then, if non-zero, a 9-byte block for the serving
 operator followed by 9 bytes per cell (serving cell first, then neighbours

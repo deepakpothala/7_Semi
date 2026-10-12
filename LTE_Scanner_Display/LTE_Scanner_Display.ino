@@ -26,7 +26,7 @@
 #define COMPANY_ID 0xFFFF
 #define MAGIC0 '7'
 #define MAGIC1 'S'
-#define PROTOCOL_VERSION 3  // v3: status carries data byte counters and NTP time
+#define PROTOCOL_VERSION 4  // v4: status also carries GNSS state, satellites and position
 
 #define NET_FLAG_4G 0x10
 #define NET_FLAG_3G 0x20
@@ -44,6 +44,12 @@
 #define DATA_NO_CONTEXT 2
 #define DATA_NTP_FAILED 3
 #define DATA_STALE_S 20  // beacon checks every ~16 s; older than this = not proven
+
+#define GNSS_OFF 0
+#define GNSS_SEARCHING 1
+#define GNSS_FIX_2D 2
+#define GNSS_FIX_3D 3
+#define GNSS_STALE_S 60  // beacon polls every ~5 s, but pauses during a network scan
 
 #define KIND_SERVING 0
 #define KIND_INTRA 1
@@ -171,6 +177,10 @@ struct StatusRx {
   uint16_t dataLatencyMs;    // NTP round trip of that check
   uint32_t bytesSent, bytesReceived;  // modem mobile data counter
   uint32_t ntpEpoch;         // UTC time from the last good NTP check, 0 = none
+  uint8_t gnssState;         // GNSS_*
+  uint8_t gnssSats, gnssInView, gnssHdop10;  // satellites used / in view, HDOP * 10
+  uint16_t gnssAge;          // seconds since the last GNSS poll, 0xFFFF = never
+  int32_t gnssLat, gnssLon;  // degrees * 1e6
   unsigned long seen;
 };
 
@@ -197,7 +207,7 @@ uint32_t get32(const uint8_t *p) {
 // formed, replaces everything the display knows in one step. Cells that the
 // beacon no longer reports therefore disappear with the next snapshot.
 bool decodeSnapshot(const uint8_t *d, size_t n, int rssi) {
-  if (n < 37 || get16(d) != COMPANY_ID || d[2] != MAGIC0 || d[3] != MAGIC1) return false;
+  if (n < 51 || get16(d) != COMPANY_ID || d[2] != MAGIC0 || d[3] != MAGIC1) return false;
   if (d[4] != PROTOCOL_VERSION) return false;
   unsigned long now = millis();
   size_t i = 6;
@@ -218,6 +228,13 @@ bool decodeSnapshot(const uint8_t *d, size_t n, int rssi) {
   s.bytesSent = get32(d + i); i += 4;
   s.bytesReceived = get32(d + i); i += 4;
   s.ntpEpoch = get32(d + i); i += 4;
+  s.gnssState = d[i++];
+  s.gnssSats = d[i++];
+  s.gnssInView = d[i++];
+  s.gnssHdop10 = d[i++];
+  s.gnssAge = get16(d + i); i += 2;
+  s.gnssLat = (int32_t)get32(d + i); i += 4;
+  s.gnssLon = (int32_t)get32(d + i); i += 4;
   s.seen = now;
 
   CellRx c[MAX_CELLS] = {};
@@ -558,15 +575,28 @@ void drawNeighbourCard(const CellRx *list, int count, const StatusRx &st) {
   canvas.setTextDatum(textdatum_t::top_left);
   canvas.drawString("NEIGHBOURS", x + 10, y + 5);
 
-  // Mobile data used, from the modem's byte counter.
+  // GNSS status from the beacon (mobile data usage is in the serial log).
   if (st.valid) {
-    char sent[12], received[12], usage[32];
-    formatBytes(st.bytesSent, sent, sizeof(sent));
-    formatBytes(st.bytesReceived, received, sizeof(received));
-    snprintf(usage, sizeof(usage), "TX %s  RX %s", sent, received);
-    canvas.setTextColor(C_ACCENT);
+    char gnss[28];
+    uint16_t gnssColor;
+    long gnssAge = st.gnssAge == 0xFFFF ? -1 : st.gnssAge + (long)(millis() - st.seen) / 1000;
+    if (st.gnssState == GNSS_FIX_3D || st.gnssState == GNSS_FIX_2D) {
+      snprintf(gnss, sizeof(gnss), "GPS %s fix, %u sats", st.gnssState == GNSS_FIX_3D ? "3D" : "2D", st.gnssSats);
+      gnssColor = C_GREEN;
+    } else if (st.gnssState == GNSS_SEARCHING) {
+      snprintf(gnss, sizeof(gnss), "GPS no fix, %u seen", st.gnssInView);
+      gnssColor = C_AMBER;
+    } else {
+      snprintf(gnss, sizeof(gnss), "GPS off");
+      gnssColor = C_DIM;
+    }
+    if (st.gnssState != GNSS_OFF && (gnssAge < 0 || gnssAge > GNSS_STALE_S)) {
+      snprintf(gnss, sizeof(gnss), "GPS no update");
+      gnssColor = C_DIM;
+    }
+    canvas.setTextColor(gnssColor);
     canvas.setTextDatum(textdatum_t::top_right);
-    canvas.drawString(usage, x + w - 8, y + 5);
+    canvas.drawString(gnss, x + w - 8, y + 5);
     canvas.setTextDatum(textdatum_t::top_left);
   }
 
@@ -801,5 +831,8 @@ void loop() {
     Serial.printf("snapshots: %lu, last %u bytes, beacon RSSI %d dBm | %s | TX %lu B RX %lu B\n",
                   (unsigned long)snapshotsReceived, (unsigned)lastSnapshotLen, beaconRssi, line,
                   (unsigned long)st.bytesSent, (unsigned long)st.bytesReceived);
+    Serial.printf("GNSS state %u, %u used / %u in view, HDOP %.1f, %.6f,%.6f, age %us\n", st.gnssState,
+                  st.gnssSats, st.gnssInView, st.gnssHdop10 / 10.0, st.gnssLat / 1e6, st.gnssLon / 1e6,
+                  st.gnssAge);
   }
 }
