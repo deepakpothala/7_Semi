@@ -1,0 +1,5 @@
+# Normalise line endings: LF in the repository, native in the working tree.
+* text=auto
+*.ino text
+*.h text
+*.md text

@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <functional>
 
+#include "Protocol.h"
+
 #if !CONFIG_BT_NIMBLE_EXT_ADV
 #error "Enable CONFIG_BT_NIMBLE_EXT_ADV in NimBLE-Arduino's src/nimconfig.h"
 #endif
@@ -35,7 +37,7 @@
 #define DATA_APN ""
 #define NTP_SERVER "pool.ntp.org"
 #define DATA_CHECK_INTERVAL_MS (10UL * 1000)
-#define DATA_RETRY_MS (30UL * 1000)
+#define DATA_RETRY_MS (15UL * 1000)
 // The modem task is single-threaded, so these waits pause every cell/status
 // update. Keep them short; a late reply is discarded by the next sendAT().
 #define DATA_ACTIVATE_TIMEOUT_MS 30000UL
@@ -45,50 +47,19 @@
 #define NETWORK_SCAN_INTERVAL_MS (3UL * 60 * 1000)  // AT+QOPS takes ~40 s
 #define NETWORK_RETRY_MS (60UL * 1000)
 #define WDT_TIMEOUT_MS 30000
-#define SIM_RETRY_CYCLES 4  // failed SIM checks before the radio is restarted
+#define SIM_RETRY_CYCLES 3  // failed SIM checks before the radio is restarted
+// GNSS constellations, set with AT+QGPSCFG="gnssconfig" at start-up (-1 leaves
+// the module alone). Measured on this module from the NMEA talkers: 0 GPS only,
+// 3 and 4 GPS + GLONASS + Galileo, 5 and 6 GPS + Galileo (the factory value),
+// 1 and 2 rejected. No setting from 0-7 showed BeiDou.
+#define GNSS_CONFIG 3
+// 1 = lock the modem to LTE (no 2G fallback), 0 = leave network mode automatic.
+#define LTE_ONLY 1
 #define MAX_AT_TIMEOUTS 3  // consecutive timeouts before re-initialising the modem
 
 #define TX_POWER_DBM 20            // ESP32-S3 maximum
 #define SNAPSHOT_INTERVAL_MS 1000  // how often the advertised snapshot is rebuilt
 #define ADV_INTERVAL_UNITS 160     // advertise every 100 ms (units of 0.625 ms)
-
-#define COMPANY_ID 0xFFFF  // Bluetooth SIG ID reserved for testing
-#define MAGIC0 '7'
-#define MAGIC1 'S'
-// v1 was one 31-byte legacy advert per record; v2 the snapshot; v3 adds the
-// mobile data byte counters and the last NTP time to the status block; v4
-// adds the GNSS fix state, satellite counts and position.
-#define PROTOCOL_VERSION 4
-#define SNAP_MAX_CELLS 8
-#define SNAP_MAX_NETS 6
-#define SNAP_MAX_BYTES 256  // 50 header+status, 1+9+8*9 cells, 1+6*19 networks = 247
-
-#define MODEM_STARTING 0
-#define MODEM_NO_SIM 1
-#define MODEM_SEARCHING 2
-#define MODEM_REGISTERED 3
-#define MODEM_NOT_RESPONDING 4
-
-#define STATUS_FLAG_NET_SCAN 0x01  // AT+QOPS in progress
-
-#define DATA_UNKNOWN 0     // not checked yet
-#define DATA_OK 1          // NTP reply received over mobile data
-#define DATA_NO_CONTEXT 2  // couldn't get an IP (APN / activation failed)
-#define DATA_NTP_FAILED 3  // had an IP but the NTP request failed
-
-#define GNSS_OFF 0        // engine not started / modem not answering
-#define GNSS_SEARCHING 1  // running, no fix yet
-#define GNSS_FIX_2D 2
-#define GNSS_FIX_3D 3
-
-#define NET_FLAG_MNC3 0x04
-#define NET_FLAG_4G 0x10
-#define NET_FLAG_3G 0x20
-#define NET_FLAG_2G 0x40
-
-#define KIND_SERVING 0
-#define KIND_INTRA 1  // neighbour on the same frequency
-#define KIND_INTER 2  // neighbour on another frequency
 
 #define SINR_UNKNOWN -128
 
@@ -139,6 +110,11 @@ static volatile uint8_t gnssState = GNSS_OFF;
 static volatile uint8_t gnssSatsUsed = 0, gnssSatsView = 0, gnssHdop10 = 0;
 static volatile int32_t gnssLat = 0, gnssLon = 0;  // degrees * 1e6
 static volatile unsigned long lastGnssPoll = 0;    // millis(), 0 = never
+static volatile unsigned long gnssSearchSince = 0;  // millis() when the current search began
+static volatile uint16_t gnssTtffSec = 0xFFFF;      // seconds to the first fix, 0xFFFF = none yet
+static volatile uint8_t viewGps = 0, viewGlo = 0, viewGal = 0, viewBds = 0;  // satellites in view
+static volatile uint8_t simRestarts = 0;  // radio restarts because the SIM was not ready
+static volatile uint8_t dataReacts = 0;   // times mobile data had to be re-activated
 
 static volatile uint32_t ntpEpoch = 0;  // UTC time from the last good NTP check, 0 = none
 
@@ -439,18 +415,6 @@ String waitForUrc(const char *prefix, unsigned long timeoutMs) {
   return "";
 }
 
-// Seconds since 1970-01-01 UTC for a civil date and time (days-from-civil
-// algorithm, valid for any Gregorian date).
-uint32_t utcEpoch(int y, int mon, int d, int h, int minute, int s) {
-  y -= mon <= 2;
-  int era = y / 400;
-  int yoe = y - era * 400;
-  int doy = (153 * (mon + (mon > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  long days = era * 146097L + doe - 719468;
-  return (uint32_t)(days * 86400L + h * 3600L + minute * 60L + s);
-}
-
 // Proves the modem can reach the internet: activates the data context if it
 // has no IP (e.g. after a modem reset), then asks an NTP server for the time.
 bool checkData() {
@@ -459,6 +423,7 @@ bool checkData() {
     Serial.println("Activating mobile data");
     sendAT("AT+QICSGP=1,1,\"" DATA_APN "\",\"\",\"\",0");
     r = sendAT("AT+QIACT=1", DATA_ACTIVATE_TIMEOUT_MS);
+    if (r.indexOf("OK") >= 0) dataReacts++;
     if (r.indexOf("OK") < 0) {
       dataState = DATA_NO_CONTEXT;
       Serial.println("Data activation failed: " + r);
@@ -518,9 +483,13 @@ void pollGnss() {
       gnssHdop10 = (uint8_t)constrain((int)lround(f[3].toDouble() * 10), 0, 255);
       gnssSatsUsed = (uint8_t)constrain(f[10].toInt(), 0, 255);
       gnssState = f[5].toInt() >= 3 ? GNSS_FIX_3D : GNSS_FIX_2D;
+      if (gnssTtffSec == 0xFFFF) {
+        gnssTtffSec = (uint16_t)min((millis() - gnssSearchSince) / 1000, 0xFFFEUL);
+      }
       lastGnssPoll = millis();
     }
   } else if (r.indexOf("516") >= 0) {  // no fix yet
+    if (gnssState == GNSS_FIX_2D || gnssState == GNSS_FIX_3D) gnssSearchSince = millis();  // fix lost
     gnssState = GNSS_SEARCHING;
     gnssSatsUsed = 0;
     gnssHdop10 = 0;
@@ -538,16 +507,28 @@ void pollGnss() {
   // that constellation's in-view count.
   r = sendAT("AT+QGPSGNMEA=\"GSV\"", 3000);
   int total = 0, pos = 0;
+  int gps = 0, glo = 0, gal = 0, bds = 0;
   while ((pos = r.indexOf("GSV,", pos)) >= 0) {
     int msgs = r.substring(pos + 4).toInt();
     int c1 = r.indexOf(',', pos + 4);
     int c2 = c1 < 0 ? -1 : r.indexOf(',', c1 + 1);
     if (msgs > 0 && c1 > 0 && c2 > 0 && r.substring(c1 + 1).toInt() == 1) {
-      total += r.substring(c2 + 1).toInt();
+      int n = r.substring(c2 + 1).toInt();
+      total += n;
+      // The two letters before "GSV" name the constellation: GP, GL, GA, GB/BD.
+      String talker = pos >= 2 ? r.substring(pos - 2, pos) : "";
+      if (talker == "GP") gps += n;
+      else if (talker == "GL") glo += n;
+      else if (talker == "GA") gal += n;
+      else if (talker == "GB" || talker == "BD") bds += n;
     }
     pos += 4;
   }
   gnssSatsView = (uint8_t)min(total, 255);
+  viewGps = min(gps, 255);
+  viewGlo = min(glo, 255);
+  viewGal = min(gal, 255);
+  viewBds = min(bds, 255);
 }
 
 void clearCells() {
@@ -595,8 +576,24 @@ bool modemInit() {
   }
   sendAT("ATE0");
   sendAT("AT+CMEE=1");  // numeric error codes
+#if LTE_ONLY
+  // No fallback to 2G: scan mode 3 = LTE only, effective immediately.
+  String scanMode = sendAT("AT+QCFG=\"nwscanmode\",3,1");
+  Serial.println(scanMode.indexOf("OK") >= 0 ? "Network mode: LTE only" : "LTE-only mode failed: " + scanMode);
+#endif
+#if GNSS_CONFIG >= 0
+  // The setting is stored in the modem and only applies to a fresh GNSS
+  // session, so touch it only when it differs.
+  String gc = sendAT("AT+QGPSCFG=\"gnssconfig\"");
+  if (gc.indexOf("\"gnssconfig\"," + String(GNSS_CONFIG)) < 0) {
+    sendAT("AT+QGPSEND");
+    sendAT("AT+QGPSCFG=\"gnssconfig\"," + String(GNSS_CONFIG));
+  }
+#endif
   sendAT("AT+QGPS=1");  // start GNSS; error 504 = already running, which is fine
   gnssState = GNSS_SEARCHING;
+  gnssSearchSince = millis();
+  gnssTtffSec = 0xFFFF;
   modemRebooted = false;
   atTimeouts = 0;
   Serial.println("Modem ready");
@@ -613,6 +610,7 @@ bool updateStatus() {
     // radio is restarted, so cycle it every few tries.
     if (!atTimeouts && ++noSimCycles % SIM_RETRY_CYCLES == 0) {
       Serial.println("SIM not ready, restarting the radio (AT+CFUN)");
+      simRestarts++;
       sendAT("AT+CFUN=0", 15000);
       vTaskDelay(pdMS_TO_TICKS(2000));
       sendAT("AT+CFUN=1", 15000);
@@ -657,6 +655,7 @@ void modemTask(void *) {
   bool haveNets = false;
   unsigned long lastNetAttempt = 0;
   bool dataOk = false;
+  bool wasRegistered = false;
   unsigned long lastDataCheck = 0;
 
   for (;;) {
@@ -673,10 +672,14 @@ void modemTask(void *) {
       }
     }
 
-    if (updateStatus()) {
+    bool registered = updateStatus();
+    if (registered) {
+      // Back on the network (or just booted): prove the internet right away.
+      if (!wasRegistered) lastDataCheck = 0;
       scanCells();
       unsigned long wait = haveNets ? NETWORK_SCAN_INTERVAL_MS : NETWORK_RETRY_MS;
       if (lastNetAttempt == 0 || millis() - lastNetAttempt > wait) {
+        pollGnss();  // the scan below blocks for ~40 s
         netScanRunning = true;
         haveNets = scanNetworks();
         netScanRunning = false;
@@ -691,6 +694,7 @@ void modemTask(void *) {
       Serial.printf("Modem state %u, not scanning\n", modemState);
       clearCells();
     }
+    wasRegistered = registered;
 
     pollGnss();
 
@@ -707,22 +711,8 @@ void modemTask(void *) {
 
 // ---------- BLE ----------
 
-void put16(uint8_t *p, uint16_t v) {
-  p[0] = v & 0xFF;
-  p[1] = v >> 8;
-}
-
-void put32(uint8_t *p, uint32_t v) {
-  for (int b = 0; b < 4; b++) p[b] = (v >> (8 * b)) & 0xFF;
-}
-
-uint16_t ageSeconds(unsigned long t, unsigned long now) {
-  if (t == 0) return 0xFFFF;  // never
-  return (uint16_t)min((now - t) / 1000, 0xFFFEUL);
-}
-
 // Builds one snapshot (status, cells, networks) in the protocol v2 layout
-// described in README.md. Returns its length, at most ~221 bytes.
+// described in README.md. Returns its length, at most ~253 bytes.
 int buildSnapshot(uint8_t *p) {
   static uint8_t snapshotSeq = 0;
   unsigned long now = millis();
@@ -734,7 +724,7 @@ int buildSnapshot(uint8_t *p) {
   p[i++] = PROTOCOL_VERSION;
   p[i++] = snapshotSeq++;
 
-  // Status (44 bytes).
+  // Status (50 bytes).
   p[i++] = modemState;
   p[i++] = netScanRunning ? STATUS_FLAG_NET_SCAN : 0;
   p[i++] = csq;
@@ -757,6 +747,12 @@ int buildSnapshot(uint8_t *p) {
   put16(p + i, ageSeconds(lastGnssPoll, now)); i += 2;
   put32(p + i, (uint32_t)gnssLat); i += 4;
   put32(p + i, (uint32_t)gnssLon); i += 4;
+  p[i++] = simRestarts;
+  p[i++] = dataReacts;
+  put16(p + i, gnssTtffSec); i += 2;
+  uint16_t searchSec = gnssState == GNSS_SEARCHING
+                           ? (uint16_t)min((now - gnssSearchSince) / 1000, 0xFFFEUL) : 0;
+  put16(p + i, searchSec); i += 2;
 
   xSemaphoreTake(dataLock, portMAX_DELAY);
 
@@ -857,7 +853,8 @@ void setup() {
     .trigger_panic = true,
   };
   if (esp_task_wdt_reconfigure(&wdt) != ESP_OK) esp_task_wdt_init(&wdt);
-  esp_task_wdt_add(NULL);  // setup() and loop() run in the same task
+  esp_err_t wdtAdd = esp_task_wdt_add(NULL);  // setup() and loop() run in the same task
+  if (wdtAdd != ESP_OK) Serial.printf("Watchdog: adding the loop task failed (%d)\n", (int)wdtAdd);
 
   // Hold the reset line released (LOW) rather than leaving it floating.
   pinMode(MODEM_RESET_PIN, OUTPUT);
@@ -877,6 +874,8 @@ void loop() {
   if (lastLog == 0 || millis() - lastLog >= 60000) {
     lastLog = millis();
     Serial.printf("BLE: snapshot %d bytes, advert TX power %d dBm\n", len, advertPowerDbm());
+    Serial.printf("GNSS: state %u, %u used, in view GPS %u GLO %u GAL %u BDS %u | SIM restarts %u, data re-activations %u\n",
+                  gnssState, gnssSatsUsed, viewGps, viewGlo, viewGal, viewBds, simRestarts, dataReacts);
   }
   esp_task_wdt_reset();
   delay(SNAPSHOT_INTERVAL_MS);

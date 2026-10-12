@@ -82,25 +82,25 @@ boards are ESP32-S3, which supports BLE 5; the original ESP32 does not.
 
 ## BLE advert format
 
-Protocol version 4. The beacon sends one non-connectable BLE 5 extended
+Protocol version 5. The beacon sends one non-connectable BLE 5 extended
 advertisement (1M PHY, every 100 ms, +20 dBm) whose manufacturer-specific
 data (AD type 0xFF) is a complete snapshot, rebuilt every second. The
 receiver replaces everything it shows with each snapshot, so a cell the
 modem stops reporting disappears with the next one. A snapshot is at most
-247 bytes, so it fits one advertising PDU without chaining. All multi-byte
+253 bytes, so it fits one advertising PDU without chaining. All multi-byte
 fields are little-endian.
 
 (Version 1 sent one 31-byte legacy advert per record in rotation; the
 status record alone had filled the 26 usable bytes. Version 2 introduced
-the snapshot; version 3 added the data byte counters and NTP time; version 4 added GNSS.)
+the snapshot; version 3 added the data byte counters and NTP time; version 4 added GNSS; version 5 added SIM / data restart counts and GNSS search and first-fix times.)
 
-Header and status, 50 bytes:
+Header and status, 56 bytes:
 
 | Bytes | Field                                                                 |
 |-------|-----------------------------------------------------------------------|
 | 0-1   | Company ID `0xFFFF` (Bluetooth SIG test ID)                           |
 | 2-3   | Magic `'7' 'S'`                                                       |
-| 4     | Protocol version (4)                                                  |
+| 4     | Protocol version (5)                                                  |
 | 5     | Snapshot sequence number                                              |
 | 6     | Modem state: 0 starting, 1 SIM not ready, 2 searching, 3 registered, 4 not responding |
 | 7     | Flags: bit 0 network scan (`AT+QOPS`) in progress                     |
@@ -123,6 +123,10 @@ Header and status, 50 bytes:
 | 40-41 | Seconds since the last GNSS poll (0xFFFF = never)                     |
 | 42-45 | Latitude, int32, degrees * 1e6 (0 without a fix)                      |
 | 46-49 | Longitude, int32, degrees * 1e6 (0 without a fix)                     |
+| 50    | Times the radio was restarted because the SIM was not ready           |
+| 51    | Times mobile data had to be re-activated                              |
+| 52-53 | Seconds from GNSS start to the first fix (0xFFFF = none yet)          |
+| 54-55 | Seconds the current GNSS search has run (0 = not searching)           |
 
 Cells: a count byte (0-8), then, if non-zero, a 9-byte block for the serving
 operator followed by 9 bytes per cell (serving cell first, then neighbours
@@ -177,3 +181,26 @@ The registered network is the one whose MCC/MNC matches the serving cell.
 - [EC200U MQTT application note](https://7semi.com/content/datasheets/EC200U-MQTT.pdf)
 - [EC200U TCP/IP application note](https://7semi.com/content/datasheets/EC200U%20TCP-IP.pdf)
 - [ESP32-S3-WROOM-1 datasheet](https://documentation.espressif.com/esp32-s3-wroom-1_wroom-1u_datasheet_en.pdf)
+
+## Building
+
+Tested with Arduino-ESP32 core 3.2.0, `arduino-cli` (bundled with the Arduino
+IDE) and these libraries in the sketchbook `libraries` folder:
+
+- **LTE_Scanner_Beacon:** NimBLE-Arduino 2.x. Uncomment
+  `#define CONFIG_BT_NIMBLE_EXT_ADV 1` in its `src/nimconfig.h` (the sketch stops
+  with an `#error` otherwise).
+- **LTE_Scanner_Display:** LovyanGFX and NimBLE-Arduino 2.x with the same
+  `nimconfig.h` change.
+
+Board options (`--fqbn`):
+
+- Beacon: `esp32:esp32:esp32s3:CDCOnBoot=cdc,PSRAM=opi,FlashSize=8M`
+- Display: `esp32:esp32:esp32s3:CDCOnBoot=cdc,PSRAM=opi,FlashSize=16M`
+
+Beacon settings worth knowing (top of `LTE_Scanner_Beacon.ino`):
+
+- `LTE_ONLY` - 1 locks the modem to LTE (`AT+QCFG="nwscanmode",3`), no 2G fallback.
+- `GNSS_CONFIG` - constellations (`AT+QGPSCFG="gnssconfig"`); 3 = GPS + GLONASS +
+  Galileo. The factory value 5 is GPS + Galileo. No value from 0-7 showed BeiDou.
+- `DATA_CHECK_INTERVAL_MS` - how often the internet check (NTP) runs.

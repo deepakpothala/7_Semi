@@ -26,7 +26,7 @@
 #define COMPANY_ID 0xFFFF
 #define MAGIC0 '7'
 #define MAGIC1 'S'
-#define PROTOCOL_VERSION 4  // v4: status also carries GNSS state, satellites and position
+#define PROTOCOL_VERSION 5  // v5: status also carries GNSS, SIM / data restart counts and fix times
 
 #define NET_FLAG_4G 0x10
 #define NET_FLAG_3G 0x20
@@ -181,12 +181,23 @@ struct StatusRx {
   uint8_t gnssSats, gnssInView, gnssHdop10;  // satellites used / in view, HDOP * 10
   uint16_t gnssAge;          // seconds since the last GNSS poll, 0xFFFF = never
   int32_t gnssLat, gnssLon;  // degrees * 1e6
+  uint8_t simRestarts, dataReacts;  // radio restarts (SIM) and mobile data re-activations
+  uint16_t gnssTtff;         // seconds to the first fix, 0xFFFF = none yet
+  uint16_t gnssSearch;       // seconds the current search has run, 0 = not searching
   unsigned long seen;
 };
 
 static CellRx cells[MAX_CELLS];
 static NetRx netTable[MAX_NETWORKS];
 static StatusRx beaconStatus;
+// Last position the beacon reported with a fix; survives the beacon going quiet.
+struct LastFix {
+  bool known;
+  uint8_t state, sats;
+  int32_t lat, lon;
+  unsigned long seen;
+};
+static LastFix lastFix = {};
 static int beaconRssi = 0;
 static unsigned long lastPacket = 0;
 static uint32_t snapshotsReceived = 0;  // for the serial log
@@ -207,7 +218,7 @@ uint32_t get32(const uint8_t *p) {
 // formed, replaces everything the display knows in one step. Cells that the
 // beacon no longer reports therefore disappear with the next snapshot.
 bool decodeSnapshot(const uint8_t *d, size_t n, int rssi) {
-  if (n < 51 || get16(d) != COMPANY_ID || d[2] != MAGIC0 || d[3] != MAGIC1) return false;
+  if (n < 57 || get16(d) != COMPANY_ID || d[2] != MAGIC0 || d[3] != MAGIC1) return false;
   if (d[4] != PROTOCOL_VERSION) return false;
   unsigned long now = millis();
   size_t i = 6;
@@ -235,6 +246,10 @@ bool decodeSnapshot(const uint8_t *d, size_t n, int rssi) {
   s.gnssAge = get16(d + i); i += 2;
   s.gnssLat = (int32_t)get32(d + i); i += 4;
   s.gnssLon = (int32_t)get32(d + i); i += 4;
+  s.simRestarts = d[i++];
+  s.dataReacts = d[i++];
+  s.gnssTtff = get16(d + i); i += 2;
+  s.gnssSearch = get16(d + i); i += 2;
   s.seen = now;
 
   CellRx c[MAX_CELLS] = {};
@@ -293,6 +308,9 @@ bool decodeSnapshot(const uint8_t *d, size_t n, int rssi) {
   memcpy(cells, c, sizeof(cells));
   memcpy(netTable, w, sizeof(netTable));
   beaconStatus = s;
+  if (s.gnssState == GNSS_FIX_2D || s.gnssState == GNSS_FIX_3D) {
+    lastFix = {true, s.gnssState, s.gnssSats, s.gnssLat, s.gnssLon, now};
+  }
   beaconRssi = rssi;
   lastPacket = now;
   snapshotsReceived++;
@@ -396,7 +414,8 @@ void drawHeader(unsigned long now, unsigned long last, int rssi, const StatusRx 
   canvas.fillSmoothCircle(312 - w - 8, 12, 3, color);
 
   // Internet: proven by the beacon's last NTP check over mobile data.
-  if (!live || !st.valid || st.dataState == DATA_UNKNOWN) return;
+  if (!live || !st.valid) return;
+  if (st.dataState == DATA_UNKNOWN && !modemProblem(st)) return;
   char net[40], netMid[32] = "", netShort[24] = "", netTiny[12] = "";
   uint16_t netColor;
   long age = st.dataAge == 0xFFFF ? -1 : st.dataAge + (long)(now - st.seen) / 1000;
@@ -410,11 +429,19 @@ void drawHeader(unsigned long now, unsigned long last, int rssi, const StatusRx 
     snprintf(netShort, sizeof(netShort), "%ums %s", st.dataLatencyMs, ago);
     snprintf(netTiny, sizeof(netTiny), "%s", ago);
     netColor = C_GREEN;
-  } else if (st.dataState == DATA_NO_CONTEXT) {
-    snprintf(net, sizeof(net), "no data");
-    netColor = C_AMBER;
   } else {
-    snprintf(net, sizeof(net), "Offline");
+    // Say why: the modem's own problem first, then what the last check found.
+    const char *why;
+    if (modemProblem(st)) {
+      static const char *reasons[] = {"modem starting", "no SIM", "no network", "", "modem silent"};
+      why = st.state < 5 && reasons[st.state][0] ? reasons[st.state] : "modem";
+    } else if (st.dataState == DATA_NO_CONTEXT) {
+      why = "no data link";
+    } else {
+      why = "no reply";
+    }
+    snprintf(net, sizeof(net), "Offline: %s", why);
+    snprintf(netMid, sizeof(netMid), "Offline");
     netColor = C_AMBER;
   }
   // Between the title and the right-hand status; drop the text, keeping the
@@ -575,6 +602,28 @@ void drawNeighbourCard(const CellRx *list, int count, const StatusRx &st) {
   canvas.setTextDatum(textdatum_t::top_left);
   canvas.drawString("NEIGHBOURS", x + 10, y + 5);
 
+  // Beacon gone quiet: keep showing where it last had a fix.
+  if (!st.valid) {
+    LastFix lf;
+    portENTER_CRITICAL(&dataMux);
+    lf = lastFix;
+    portEXIT_CRITICAL(&dataMux);
+    if (lf.known) {
+      long t = (long)(millis() - lf.seen) / 1000;
+      char ago[12], line[48];
+      if (t < 60) snprintf(ago, sizeof(ago), "%lds", t);
+      else if (t < 3600) snprintf(ago, sizeof(ago), "%ldm", t / 60);
+      else snprintf(ago, sizeof(ago), "%ldh", t / 3600);
+      canvas.setTextColor(C_DIM);
+      canvas.setTextDatum(textdatum_t::top_right);
+      canvas.drawString("last GPS fix", x + w - 8, y + 5);
+      canvas.setTextDatum(textdatum_t::top_left);
+      snprintf(line, sizeof(line), "%.5f, %.5f  %s ago", lf.lat / 1e6, lf.lon / 1e6, ago);
+      canvas.drawString(line, x + 10, y + 22);
+      return;
+    }
+  }
+
   // GNSS status from the beacon (mobile data usage is in the serial log).
   if (st.valid) {
     char gnss[28], gnssShort[16] = "", gnssTiny[8] = "";
@@ -595,7 +644,9 @@ void drawNeighbourCard(const CellRx *list, int count, const StatusRx &st) {
       snprintf(gnss, sizeof(gnss), "GPS off");
       gnssColor = C_DIM;
     }
-    if (st.gnssState != GNSS_OFF && (gnssAge < 0 || gnssAge > GNSS_STALE_S)) {
+    // The modem cannot report GNSS during its ~40 s network scan; that is not a fault.
+    bool scanning = st.flags & STATUS_FLAG_NET_SCAN;
+    if (st.gnssState != GNSS_OFF && !scanning && (gnssAge < 0 || gnssAge > GNSS_STALE_S)) {
       snprintf(gnss, sizeof(gnss), "GPS no update");
       snprintf(gnssShort, sizeof(gnssShort), "GPS ?");
       snprintf(gnssTiny, sizeof(gnssTiny), "?");
@@ -614,15 +665,56 @@ void drawNeighbourCard(const CellRx *list, int count, const StatusRx &st) {
     canvas.setTextDatum(textdatum_t::top_left);
   }
 
-  // With a GNSS fix, the chip row alternates with the position every 4 s.
-  bool fix = st.valid && (st.gnssState == GNSS_FIX_3D || st.gnssState == GNSS_FIX_2D);
-  if (fix && (millis() / 4000) % 2 == 1) {
-    char pos[40];
-    snprintf(pos, sizeof(pos), "%.5f, %.5f  HDOP %.1f", st.gnssLat / 1e6, st.gnssLon / 1e6, st.gnssHdop10 / 10.0);
-    canvas.setFont(&fonts::DejaVu9);
-    canvas.setTextColor(C_TEXT);
-    canvas.setTextDatum(textdatum_t::top_left);
-    canvas.drawString(pos, x + 10, y + 22);
+  // The second row rotates every 4 s: neighbour chips, GNSS detail and beacon
+  // health. Pages with nothing to say are skipped.
+  int phases[3], numPhases = 0;
+  phases[numPhases++] = 0;
+  if (st.valid && st.gnssState != GNSS_OFF) phases[numPhases++] = 1;
+  if (st.valid) phases[numPhases++] = 2;
+  int phase = phases[(millis() / 4000) % numPhases];
+  long sinceSeen = st.valid ? (long)(millis() - st.seen) / 1000 : 0;
+  canvas.setFont(&fonts::DejaVu9);
+  canvas.setTextDatum(textdatum_t::top_left);
+
+  if (phase == 1) {
+    char line[48];
+    if (st.gnssState == GNSS_FIX_3D || st.gnssState == GNSS_FIX_2D) {
+      snprintf(line, sizeof(line), "%.5f, %.5f  HDOP %.1f", st.gnssLat / 1e6, st.gnssLon / 1e6, st.gnssHdop10 / 10.0);
+      canvas.setTextColor(C_TEXT);
+    } else {
+      long t = st.gnssSearch + sinceSeen;
+      snprintf(line, sizeof(line), "searching %ldm%02lds, %u in view", t / 60, t % 60, st.gnssInView);
+      canvas.setTextColor(C_AMBER);
+    }
+    canvas.drawString(line, x + 10, y + 22);
+    return;
+  }
+
+  if (phase == 2) {
+    // Beacon health, as many items as fit: uptime, time to first fix, restarts.
+    char line[64] = "", part[24];
+    auto add = [&](const char *text) {
+      char joined[64];
+      snprintf(joined, sizeof(joined), "%s%s%s", line, line[0] ? "   " : "", text);
+      if (canvas.textWidth(joined) <= w - 20) strcpy(line, joined);
+    };
+    long up = st.uptime + sinceSeen;
+    if (up >= 86400) snprintf(part, sizeof(part), "up %ldd%ldh", up / 86400, up % 86400 / 3600);
+    else if (up >= 3600) snprintf(part, sizeof(part), "up %ldh%02ldm", up / 3600, up % 3600 / 60);
+    else snprintf(part, sizeof(part), "up %ldm", up / 60);
+    add(part);
+    if (st.gnssTtff != 0xFFFF) {
+      snprintf(part, sizeof(part), "fix took %us", st.gnssTtff);
+      add(part);
+    }
+    snprintf(part, sizeof(part), "data rst %u", st.dataReacts);
+    add(part);
+    snprintf(part, sizeof(part), "SIM rst %u", st.simRestarts);
+    add(part);
+    snprintf(part, sizeof(part), "modem rst %u", st.recoveries + st.hardResets);
+    add(part);
+    canvas.setTextColor(C_DIM);
+    canvas.drawString(line, x + 10, y + 22);
     return;
   }
 
@@ -857,8 +949,10 @@ void loop() {
     Serial.printf("snapshots: %lu, last %u bytes, beacon RSSI %d dBm | %s | TX %lu B RX %lu B\n",
                   (unsigned long)snapshotsReceived, (unsigned)lastSnapshotLen, beaconRssi, line,
                   (unsigned long)st.bytesSent, (unsigned long)st.bytesReceived);
-    Serial.printf("GNSS state %u, %u used / %u in view, HDOP %.1f, %.6f,%.6f, age %us\n", st.gnssState,
-                  st.gnssSats, st.gnssInView, st.gnssHdop10 / 10.0, st.gnssLat / 1e6, st.gnssLon / 1e6,
-                  st.gnssAge);
+    Serial.printf("GNSS state %u, %u used / %u in view, HDOP %.1f, %.6f,%.6f, age %us, search %us, first fix %us\n",
+                  st.gnssState, st.gnssSats, st.gnssInView, st.gnssHdop10 / 10.0, st.gnssLat / 1e6,
+                  st.gnssLon / 1e6, st.gnssAge, st.gnssSearch, st.gnssTtff);
+    Serial.printf("Beacon: SIM restarts %u, data re-activations %u, modem restarts %u/%u\n", st.simRestarts,
+                  st.dataReacts, st.recoveries, st.hardResets);
   }
 }
