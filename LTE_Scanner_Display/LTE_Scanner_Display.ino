@@ -577,14 +577,19 @@ void drawNeighbourCard(const CellRx *list, int count, const StatusRx &st) {
 
   // GNSS status from the beacon (mobile data usage is in the serial log).
   if (st.valid) {
-    char gnss[28];
+    char gnss[28], gnssShort[16] = "", gnssTiny[8] = "";
     uint16_t gnssColor;
     long gnssAge = st.gnssAge == 0xFFFF ? -1 : st.gnssAge + (long)(millis() - st.seen) / 1000;
     if (st.gnssState == GNSS_FIX_3D || st.gnssState == GNSS_FIX_2D) {
-      snprintf(gnss, sizeof(gnss), "GPS %s fix, %u sats", st.gnssState == GNSS_FIX_3D ? "3D" : "2D", st.gnssSats);
+      const char *dim = st.gnssState == GNSS_FIX_3D ? "3D" : "2D";
+      snprintf(gnss, sizeof(gnss), "GPS %s fix, %u sats", dim, st.gnssSats);
+      snprintf(gnssShort, sizeof(gnssShort), "GPS %s %u", dim, st.gnssSats);
+      snprintf(gnssTiny, sizeof(gnssTiny), "%s %u", dim, st.gnssSats);
       gnssColor = C_GREEN;
     } else if (st.gnssState == GNSS_SEARCHING) {
       snprintf(gnss, sizeof(gnss), "GPS no fix, %u seen", st.gnssInView);
+      snprintf(gnssShort, sizeof(gnssShort), "GPS -- %u", st.gnssInView);
+      snprintf(gnssTiny, sizeof(gnssTiny), "-- %u", st.gnssInView);
       gnssColor = C_AMBER;
     } else {
       snprintf(gnss, sizeof(gnss), "GPS off");
@@ -592,11 +597,20 @@ void drawNeighbourCard(const CellRx *list, int count, const StatusRx &st) {
     }
     if (st.gnssState != GNSS_OFF && (gnssAge < 0 || gnssAge > GNSS_STALE_S)) {
       snprintf(gnss, sizeof(gnss), "GPS no update");
+      snprintf(gnssShort, sizeof(gnssShort), "GPS ?");
+      snprintf(gnssTiny, sizeof(gnssTiny), "?");
       gnssColor = C_DIM;
     }
+    // Longest text that fits to the right of the "NEIGHBOURS" label.
+    int labelEnd = x + 10 + canvas.textWidth("NEIGHBOURS") + 8;
+    const char *options[] = {gnss, gnssShort, gnssTiny};
     canvas.setTextColor(gnssColor);
     canvas.setTextDatum(textdatum_t::top_right);
-    canvas.drawString(gnss, x + w - 8, y + 5);
+    for (const char *text : options) {
+      if (!text[0] || x + w - 8 - canvas.textWidth(text) < labelEnd) continue;
+      canvas.drawString(text, x + w - 8, y + 5);
+      break;
+    }
     canvas.setTextDatum(textdatum_t::top_left);
   }
 
