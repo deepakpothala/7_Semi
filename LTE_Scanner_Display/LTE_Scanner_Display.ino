@@ -43,7 +43,7 @@
 #define DATA_OK 1
 #define DATA_NO_CONTEXT 2
 #define DATA_NTP_FAILED 3
-#define DATA_STALE_S 20  // beacon checks every ~16 s; older than this = not proven
+#define DATA_STALE_S 30  // beacon checks every ~16 s; older than this = not proven
 
 #define GNSS_OFF 0
 #define GNSS_SEARCHING 1
@@ -612,6 +612,18 @@ void drawNeighbourCard(const CellRx *list, int count, const StatusRx &st) {
       break;
     }
     canvas.setTextDatum(textdatum_t::top_left);
+  }
+
+  // With a GNSS fix, the chip row alternates with the position every 4 s.
+  bool fix = st.valid && (st.gnssState == GNSS_FIX_3D || st.gnssState == GNSS_FIX_2D);
+  if (fix && (millis() / 4000) % 2 == 1) {
+    char pos[40];
+    snprintf(pos, sizeof(pos), "%.5f, %.5f  HDOP %.1f", st.gnssLat / 1e6, st.gnssLon / 1e6, st.gnssHdop10 / 10.0);
+    canvas.setFont(&fonts::DejaVu9);
+    canvas.setTextColor(C_TEXT);
+    canvas.setTextDatum(textdatum_t::top_left);
+    canvas.drawString(pos, x + 10, y + 22);
+    return;
   }
 
   if (count == 0) {

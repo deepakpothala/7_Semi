@@ -45,6 +45,7 @@
 #define NETWORK_SCAN_INTERVAL_MS (3UL * 60 * 1000)  // AT+QOPS takes ~40 s
 #define NETWORK_RETRY_MS (60UL * 1000)
 #define WDT_TIMEOUT_MS 30000
+#define SIM_RETRY_CYCLES 4  // failed SIM checks before the radio is restarted
 #define MAX_AT_TIMEOUTS 3  // consecutive timeouts before re-initialising the modem
 
 #define TX_POWER_DBM 20            // ESP32-S3 maximum
@@ -604,11 +605,23 @@ bool modemInit() {
 
 // Checks SIM, signal and registration. Returns true when registered on LTE.
 bool updateStatus() {
+  static int noSimCycles = 0;
   String r = sendAT("AT+CPIN?");
   if (r.indexOf("READY") < 0) {
     modemState = atTimeouts ? MODEM_NOT_RESPONDING : MODEM_NO_SIM;
+    // The modem doesn't notice a SIM that was removed and put back until its
+    // radio is restarted, so cycle it every few tries.
+    if (!atTimeouts && ++noSimCycles % SIM_RETRY_CYCLES == 0) {
+      Serial.println("SIM not ready, restarting the radio (AT+CFUN)");
+      sendAT("AT+CFUN=0", 15000);
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      sendAT("AT+CFUN=1", 15000);
+      vTaskDelay(pdMS_TO_TICKS(3000));
+      sendAT("AT+QGPS=1");  // make sure GNSS is still running
+    }
     return false;
   }
+  noSimCycles = 0;
 
   r = sendAT("AT+CSQ");  // +CSQ: <rssi>,<ber>
   int p = r.indexOf("+CSQ:");
