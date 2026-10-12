@@ -34,8 +34,12 @@
 // from an NTP server. A blank APN works on O2 UK; set your operator's otherwise.
 #define DATA_APN ""
 #define NTP_SERVER "pool.ntp.org"
-#define DATA_CHECK_INTERVAL_MS (2UL * 60 * 1000)
+#define DATA_CHECK_INTERVAL_MS (10UL * 1000)
 #define DATA_RETRY_MS (30UL * 1000)
+// The modem task is single-threaded, so these waits pause every cell/status
+// update. Keep them short; a late reply is discarded by the next sendAT().
+#define DATA_ACTIVATE_TIMEOUT_MS 30000UL
+#define NTP_URC_TIMEOUT_MS 15000UL
 
 #define CELL_SCAN_INTERVAL_MS 5000
 #define NETWORK_SCAN_INTERVAL_MS (3UL * 60 * 1000)  // AT+QOPS takes ~40 s
@@ -441,7 +445,7 @@ bool checkData() {
   if (r.indexOf("+QIACT: 1,1") < 0) {
     Serial.println("Activating mobile data");
     sendAT("AT+QICSGP=1,1,\"" DATA_APN "\",\"\",\"\",0");
-    r = sendAT("AT+QIACT=1", 150000);
+    r = sendAT("AT+QIACT=1", DATA_ACTIVATE_TIMEOUT_MS);
     if (r.indexOf("OK") < 0) {
       dataState = DATA_NO_CONTEXT;
       Serial.println("Data activation failed: " + r);
@@ -455,7 +459,7 @@ bool checkData() {
   String urc = "";
   int p = r.indexOf("+QNTP:");
   if (p >= 0) urc = r.substring(p);
-  else if (r.indexOf("OK") >= 0) urc = waitForUrc("+QNTP:", 125000);  // AT manual max response time
+  else if (r.indexOf("OK") >= 0) urc = waitForUrc("+QNTP:", NTP_URC_TIMEOUT_MS);
   unsigned long latency = millis() - t0;
 
   if (urc.length() == 0 || urc.substring(6).toInt() != 0) {

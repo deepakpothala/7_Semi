@@ -43,7 +43,7 @@
 #define DATA_OK 1
 #define DATA_NO_CONTEXT 2
 #define DATA_NTP_FAILED 3
-#define DATA_STALE_S 300  // beacon checks every 2 min; older than this = not proven
+#define DATA_STALE_S 20  // beacon checks every ~16 s; older than this = not proven
 
 #define KIND_SERVING 0
 #define KIND_INTRA 1
@@ -380,17 +380,24 @@ void drawHeader(unsigned long now, unsigned long last, int rssi, const StatusRx 
 
   // Internet: proven by the beacon's last NTP check over mobile data.
   if (!live || !st.valid || st.dataState == DATA_UNKNOWN) return;
-  char net[24];
+  char net[40], netMid[32] = "", netShort[24] = "", netTiny[12] = "";
   uint16_t netColor;
   long age = st.dataAge == 0xFFFF ? -1 : st.dataAge + (long)(now - st.seen) / 1000;
   if (st.dataState == DATA_OK && age >= 0 && age <= DATA_STALE_S) {
-    snprintf(net, sizeof(net), "web %u ms", st.dataLatencyMs);
+    // Counts up every redraw: "Online 357ms 12s ago".
+    char ago[12];
+    if (age < 60) snprintf(ago, sizeof(ago), "%lds", age);
+    else snprintf(ago, sizeof(ago), "%ldm%02lds", age / 60, age % 60);
+    snprintf(net, sizeof(net), "Online %ums %s ago", st.dataLatencyMs, ago);
+    snprintf(netMid, sizeof(netMid), "Online %ums %s", st.dataLatencyMs, ago);
+    snprintf(netShort, sizeof(netShort), "%ums %s", st.dataLatencyMs, ago);
+    snprintf(netTiny, sizeof(netTiny), "%s", ago);
     netColor = C_GREEN;
   } else if (st.dataState == DATA_NO_CONTEXT) {
     snprintf(net, sizeof(net), "no data");
     netColor = C_AMBER;
   } else {
-    snprintf(net, sizeof(net), "web down");
+    snprintf(net, sizeof(net), "Offline");
     netColor = C_AMBER;
   }
   // Between the title and the right-hand status; drop the text, keeping the
@@ -398,10 +405,14 @@ void drawHeader(unsigned long now, unsigned long last, int rssi, const StatusRx 
   int dotX = titleEnd + 12;
   int statusStart = 312 - w - 14;
   canvas.fillSmoothCircle(dotX, 12, 3, netColor);
-  if (dotX + 8 + canvas.textWidth(net) < statusStart) {
+  // Longest text that fits, dropping "ago", then "Online", then the latency.
+  const char *options[] = {net, netMid, netShort, netTiny};
+  for (const char *text : options) {
+    if (!text[0] || dotX + 8 + canvas.textWidth(text) >= statusStart) continue;
     canvas.setTextColor(netColor == C_GREEN ? C_DIM : netColor);
     canvas.setTextDatum(textdatum_t::middle_left);
-    canvas.drawString(net, dotX + 8, 12);
+    canvas.drawString(text, dotX + 8, 12);
+    break;
   }
 }
 
